@@ -1,0 +1,6 @@
+#define FS_READ_PARAMS \
+    X(0, path,   RPC_FIELD_STRING) \
+    X(1, offset, RPC_FIELD_UINT32) \
+    X(2, size,   RPC_FIELD_UINT32)
+
+RPC_METHOD(fs_read, "fs.read", FS_READ_PARAMS, RPC_RESULT_BYTES)

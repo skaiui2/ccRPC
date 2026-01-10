@@ -1,0 +1,4 @@
+#define SHELL_EXEC_PARAMS \
+    X(0, cmd, RPC_FIELD_STRING)
+
+RPC_METHOD(shell_exec, "shell.exec", SHELL_EXEC_PARAMS, RPC_RESULT_STRING)
