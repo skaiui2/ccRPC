@@ -1,4 +1,28 @@
-#define SHELL_EXEC_PARAMS \
-    X(0, cmd, RPC_FIELD_STRING)
+/* NodeB: 提供 shell_exec，请求 fs_read */
 
-RPC_METHOD(shell_exec, "shell.exec", SHELL_EXEC_PARAMS, RPC_RESULT_STRING)
+RPC_METHOD_PROVIDER(
+    shell_exec,
+    "shell.exec",
+    PARAMS(
+        FIELD(string, cmd);
+    ),
+    RESULTS(
+        FIELD(string, output);
+        FIELD(u32, exitcode);
+    )
+)
+
+RPC_METHOD_REQUEST(
+    fs_read,
+    "fs.read",
+    PARAMS(
+        FIELD(string, path);
+        FIELD(u32, offset);
+        FIELD(u32, size);
+    ),
+    RESULTS(
+        FIELD(bytes, data);
+        FIELD(u32, len);
+        FIELD(u32, eof);
+    )
+)

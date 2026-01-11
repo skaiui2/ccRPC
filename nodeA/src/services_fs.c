@@ -1,21 +1,29 @@
+#include "services_fs.h"
+#include "rpc_tlv.h"    
 #include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
-#include <memory.h>
-#include "rpc_methods_decl.h"
+#include "rpc_tlv.h"
+#include "rpc_gen.h"
 
-int fs_read_handler(const struct rpc_param_fs_read *p,
-                    struct rpc_result *r)
+#include "rpc_gen.h"
+#include <stdio.h>
+#include <string.h>
+
+// 由 rpc_gen.c 自动 forward declare
+int fs_read_handler(const struct rpc_param_fs_read *in,
+                    struct rpc_result_fs_read *out)
 {
-    printf("[NodeA] fs.read path=%s offset=%u size=%u\n",
-           p->path, p->offset, p->size);
+    printf("NodeA: fs_read(path=%s, offset=%u, size=%u)\n",
+           in->path ? in->path : "(null)",
+           (unsigned)in->offset,
+           (unsigned)in->size);
 
-    uint8_t *buf = malloc(p->size);
-    memset(buf, 'A', p->size);
-
-    r->type = RPC_RESULT_BYTES;
-    r->data = buf;
-    r->len  = p->size;
+    //返回固定内容 
+    static uint8_t dummy[] = "hello-from-NodeA";
+    out->data.ptr = dummy;
+    out->data.len = sizeof(dummy) - 1;
+    out->len = out->data.len;
+    out->eof = 1;
 
     return 0;
 }

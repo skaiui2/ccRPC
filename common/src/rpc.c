@@ -1,191 +1,278 @@
 #include <string.h>
 #include <stdlib.h>
+#include <arpa/inet.h>
 #include "hashmap.h"
 #include "rpc.h"
-#include "rpc_method.h"
-#include "rpc_result.h"
+
+
+struct pending_call {
+    uint32_t      seq;
+    uint8_t      *buf;       // 响应 TLV 存放地址（由调用方提供） 
+    size_t        buf_size;  // buf 的最大长度 
+    size_t        resp_len;  
+    rpc_status_t  status;
+    int           done;
+};
+
+
+struct rpc_method_entry {
+    const char *name;
+    rpc_param_parser_t   parse_param;
+    rpc_handler_t        handler;
+    rpc_result_encoder_t encode_result;
+};
+
 
 static struct hashmap g_methods;
 static rpc_transport_t *g_transport = NULL;
 
-/* Simple sync call state; single outstanding request at a time */
-static uint16_t g_next_req_id     = 1;
-static uint16_t g_waiting_req_id  = 0;
-static int      g_response_ready  = 0;
+static uint32_t g_next_seq = 1;
+static struct hashmap g_pending;
 
-static uint8_t g_response_buffer[512];
-static size_t  g_response_len     = 0;
+#ifndef RPC_MAX_PARAM_SIZE
+#define RPC_MAX_PARAM_SIZE   256
+#endif
 
-static uint16_t rpc_next_req_id(void) {
-    return g_next_req_id++;
+#ifndef RPC_MAX_RESULT_SIZE
+#define RPC_MAX_RESULT_SIZE  256
+#endif
+
+#ifndef RPC_MAX_RESULT_TLV_SIZE
+#define RPC_MAX_RESULT_TLV_SIZE 512
+#endif
+
+static uint8_t param_buf[RPC_MAX_PARAM_SIZE];
+static uint8_t result_buf[RPC_MAX_RESULT_SIZE];
+
+static char    method[128];
+static uint8_t resp_tlv[RPC_MAX_RESULT_TLV_SIZE];
+
+// max tcp segment
+static uint8_t poll_buf[1500];
+
+static uint32_t rpc_next_seq(void) {
+    uint32_t s = g_next_seq++;
+    if (g_next_seq == 0)
+        g_next_seq = 1;
+    return s;
 }
 
-/* Decode raw bytes into rpc_message (shallow copy) */
-static struct rpc_message *rpc_decode(const uint8_t *buf, size_t len) {
-    if (len < sizeof(struct rpc_header))
-        return NULL;
-
-    struct rpc_message *msg = malloc(len);
-    if (!msg)
-        return NULL;
-
-    memcpy(msg, buf, len);
-    return msg;
-}
-
-/* Core send helpers (TLV payload only) */
-
-static int rpc_send_response_tlv(uint16_t req_id,
+static int rpc_send_response_tlv(uint32_t seq,
+                                 rpc_status_t status,
                                  const uint8_t *tlv, size_t tlv_len)
 {
-    if (tlv_len > 255)
-        return -1;
+    size_t total;
+    struct rpc_message *msg;
+    int ret;
+    
+    total = sizeof(struct rpc_header) + tlv_len;
 
-    size_t total = sizeof(struct rpc_header) + tlv_len;
-    struct rpc_message *msg = malloc(total);
+    msg = malloc(total);
     if (!msg)
         return -1;
 
-    msg->hdr.req_id  = req_id;
-    msg->hdr.type    = RPC_MSG_RESPONSE;
-    msg->hdr.reserved = (uint8_t)tlv_len;
+    msg->hdr.version    = htons(RPC_VERSION_2_0);
+    msg->hdr.flags      = htons(RPC_FLAG_RESPONSE |
+                                (status != RPC_STATUS_OK ? RPC_FLAG_ERROR : 0));
+    msg->hdr.seq        = htonl(seq);
+    msg->hdr.method_len = htons(0);
+    msg->hdr.status     = htons((uint16_t)status);
 
-    if (tlv_len > 0)
+    if (tlv_len > 0 && tlv)
         memcpy(msg->payload, tlv, tlv_len);
 
-    int r = g_transport->send(g_transport->user,
+    ret = g_transport->send(g_transport->user,
                               (const uint8_t *)msg, total);
     free(msg);
-    return r;
+    return ret;
 }
 
-static int rpc_send_request_tlv(uint16_t req_id,
+static int rpc_send_request_tlv(uint32_t seq,
                                 const char *method,
                                 const uint8_t *tlv, size_t tlv_len)
 {
-    if (tlv_len > 255)
-        return -1;
+    size_t mlen;
+    size_t total;
+    int ret;
 
-    size_t mlen = strlen(method);
-    size_t total_payload = mlen + 1 + tlv_len;
-    size_t total = sizeof(struct rpc_header) + total_payload;
+    mlen = strlen(method);
+    total = sizeof(struct rpc_header) + mlen + tlv_len;
 
     struct rpc_message *msg = malloc(total);
     if (!msg)
         return -1;
 
-    msg->hdr.req_id   = req_id;
-    msg->hdr.type     = RPC_MSG_REQUEST;
-    msg->hdr.reserved = (uint8_t)tlv_len;
+    msg->hdr.version    = htons(RPC_VERSION_2_0);
+    msg->hdr.flags      = htons(0); // request 
+    msg->hdr.seq        = htonl(seq);
+    msg->hdr.method_len = htons((uint16_t)mlen);
+    msg->hdr.status     = htons(0);
 
-    /* payload = method\0 + tlv */
-    memcpy(msg->payload, method, mlen + 1);
-    if (tlv_len > 0)
-        memcpy(msg->payload + mlen + 1, tlv, tlv_len);
+    memcpy(msg->payload, method, mlen);
+    if (tlv_len > 0 && tlv)
+        memcpy(msg->payload + mlen, tlv, tlv_len);
 
-    int r = g_transport->send(g_transport->user,
+    ret = g_transport->send(g_transport->user,
                               (const uint8_t *)msg, total);
     free(msg);
-    return r;
+    return ret;
 }
 
-/* Request handling: fully table-driven */
+static void rpc_handle_request(const struct rpc_message *msg, size_t len)
+{
+    size_t tmp;               
+    uint32_t seq;
+    uint16_t method_len;
+    const uint8_t *tlv;
+    struct rpc_method_entry *m;
+    rpc_status_t status;
+    int rc;                   
 
-static void rpc_handle_request(const struct rpc_message *msg) {
-    const char *method = (const char *)msg->payload;
+    if (len < sizeof(struct rpc_header))
+        return;
 
-    size_t mlen = strlen(method);
-    const uint8_t *tlv = msg->payload + mlen + 1;
-    size_t tlv_len = msg->hdr.reserved;
+    if (ntohs(msg->hdr.version) != RPC_VERSION_2_0)
+        return;
 
-    struct rpc_method_entry *m =
-        hashmap_get(&g_methods, (void *)method);
+    seq        = ntohl(msg->hdr.seq);
+    method_len = ntohs(msg->hdr.method_len);
 
+    tmp = len - sizeof(struct rpc_header);  
+    if (tmp < method_len)
+        return;
+
+    if (method_len == 0 || method_len >= sizeof(method))
+        return;
+
+    memcpy(method, msg->payload, method_len);
+    method[method_len] = '\0';
+
+    tlv     = msg->payload + method_len;
+    tmp    -= method_len;                
+
+    m = hashmap_get(&g_methods, (void *)method);
     if (!m) {
-        static const uint8_t err[] =
-            { 0x02, 12, 0, 'N','O','T','_','F','O','U','N','D' };
-        rpc_send_response_tlv(msg->hdr.req_id, err, sizeof(err));
+        rpc_send_response_tlv(seq, RPC_STATUS_METHOD_NOT_FOUND, NULL, 0);
         return;
     }
 
-    /* parse_param → param struct (stack buffer, method-specific layout) */
-    uint8_t param_buf[256];
-    memset(param_buf, 0, sizeof(param_buf));
-    void *param = param_buf;
+    status = RPC_STATUS_OK;
 
-    if (m->parse_param)
-        m->parse_param(tlv, tlv_len, param);
+    memset(param_buf,  0, sizeof(param_buf));
+    memset(result_buf, 0, sizeof(result_buf));
 
-    /* handler(param) → rpc_result */
-    struct rpc_result r;
-    memset(&r, 0, sizeof(r));
+    if (m->parse_param) {
+        rc = m->parse_param(tlv, tmp, param_buf);
+        if (rc != 0)
+            status = RPC_STATUS_INVALID_PARAMS;
+    }
 
-    m->handler(param, &r);
+    if (status == RPC_STATUS_OK && m->handler) {
+        rc = m->handler(param_buf, result_buf);
+        if (rc != 0)
+            status = RPC_STATUS_INTERNAL_ERROR;
+    }
 
-    /* rpc_result → TLV */
-    uint8_t *resp_tlv = NULL;
-    size_t   resp_len = 0;
+    size_t resp_len = 0;
+    memset(resp_tlv, 0, sizeof(resp_tlv));
 
-    m->encode_result(&r, &resp_tlv, &resp_len);
+    if (status == RPC_STATUS_OK && m->encode_result) {
+        rc = m->encode_result(result_buf, resp_tlv, &resp_len);
+        if (rc != 0) {
+            status = RPC_STATUS_INTERNAL_ERROR;
+            resp_len = 0;
+        }
+    }
 
-    rpc_send_response_tlv(msg->hdr.req_id, resp_tlv, resp_len);
-
-    free(resp_tlv);
+    rpc_send_response_tlv(seq,
+                          status,
+                          (status == RPC_STATUS_OK && resp_len > 0) ? resp_tlv : NULL,
+                          (status == RPC_STATUS_OK) ? resp_len : 0);
 }
 
-/* Response handling: single-flight sync call */
+static void rpc_handle_response(const struct rpc_message *msg, size_t len)
+{
+    size_t tmp;                  
+    uint32_t seq;
+    uint16_t status;
+    struct pending_call *pc;
 
-static void rpc_handle_response(const struct rpc_message *msg) {
-    if (msg->hdr.req_id != g_waiting_req_id)
+    if (len < sizeof(struct rpc_header))
         return;
 
-    size_t len = msg->hdr.reserved;
-    if (len > sizeof(g_response_buffer))
-        len = sizeof(g_response_buffer);
+    if (ntohs(msg->hdr.version) != RPC_VERSION_2_0)
+        return;
 
-    memcpy(g_response_buffer, msg->payload, len);
-    g_response_len   = len;
-    g_response_ready = 1;
+    seq    = ntohl(msg->hdr.seq);
+    status = ntohs(msg->hdr.status);
+
+    pc = hashmap_get(&g_pending, (void *)(uintptr_t)seq);
+    if (!pc)
+        return;
+
+    tmp = len - sizeof(struct rpc_header); 
+
+    if (tmp > pc->buf_size)
+        tmp = pc->buf_size;             
+
+    if (pc->buf && tmp > 0)
+        memcpy(pc->buf, msg->payload, tmp);
+
+    pc->resp_len = tmp;
+    pc->status   = (rpc_status_t)status;
+    pc->done     = 1;
 }
 
-/* Public API */
+
 
 void rpc_init(void) {
-    hashmap_init(&g_methods, 64, HASHMAP_KEY_STRING);
-    g_transport       = NULL;
-    g_next_req_id     = 1;
-    g_waiting_req_id  = 0;
-    g_response_ready  = 0;
-    g_response_len    = 0;
+    hashmap_init(&g_methods,  64, HASHMAP_KEY_STRING);
+    hashmap_init(&g_pending,  64, HASHMAP_KEY_INT);
+    g_transport = NULL;
+    g_next_seq  = 1;
 }
 
 void rpc_set_transport(rpc_transport_t *t) {
     g_transport = t;
 }
 
+
 int rpc_call_with_tlv(const char *method,
                       const uint8_t *tlv, size_t tlv_len,
                       uint8_t *resp_tlv, size_t *resp_len)
 {
-    uint16_t req_id = rpc_next_req_id();
-    g_waiting_req_id  = req_id;
-    g_response_ready  = 0;
+    uint32_t seq;
+    if (!g_transport)
+        return -RPC_STATUS_TRANSPORT_ERROR;
 
-    int r = rpc_send_request_tlv(req_id, method, tlv, tlv_len);
-    if (r < 0)
-        return r;
+    seq = rpc_next_seq();
 
-    /* simple sync wait; transport is expected to drive rpc_poll() */
-    while (!g_response_ready)
-        rpc_poll();
+    struct pending_call pc = {
+        .seq      = seq,
+        .buf      = resp_tlv,
+        .buf_size = resp_len ? *resp_len : 0,
+        .resp_len = 0,
+        .status   = RPC_STATUS_OK,
+        .done     = 0
+    };
 
-    if (resp_tlv && resp_len) {
-        size_t len = g_response_len;
-        memcpy(resp_tlv, g_response_buffer, len);
-        *resp_len = len;
+    hashmap_put(&g_pending, (void *)(uintptr_t)seq, &pc);
+
+    int r = rpc_send_request_tlv(seq, method, tlv, tlv_len);
+    if (r < 0) {
+        hashmap_remove(&g_pending, (void *)(uintptr_t)seq);
+        return -RPC_STATUS_TRANSPORT_ERROR;
     }
 
-    return 0;
+    while (!pc.done)
+        rpc_poll();
+
+    hashmap_remove(&g_pending, (void *)(uintptr_t)seq);
+
+    if (resp_tlv && resp_len)
+        *resp_len = pc.resp_len;
+
+    return (int)pc.status;
 }
 
 void rpc_register_method(const char *name,
@@ -197,31 +284,39 @@ void rpc_register_method(const char *name,
     if (!e)
         return;
 
-    e->name         = name;
-    e->parse_param  = parser;
-    e->handler      = handler;
+    e->name          = name;
+    e->parse_param   = parser;
+    e->handler       = handler;
     e->encode_result = encoder;
 
     hashmap_put(&g_methods, (void *)name, e);
 }
 
-void rpc_poll(void) {
+void rpc_poll(void)
+{
+    ssize_t n;
+    struct rpc_message *msg;
+    uint16_t flags;
+    uint16_t method_len;
+
     if (!g_transport)
         return;
 
-    uint8_t buf[512];
-    ssize_t n = g_transport->recv(g_transport->user, buf, sizeof(buf));
+    n = g_transport->recv(g_transport->user, poll_buf, sizeof(poll_buf));
     if (n <= 0)
         return;
 
-    struct rpc_message *msg = rpc_decode(buf, (size_t)n);
-    if (!msg)
+    if (n < sizeof(struct rpc_header))
         return;
 
-    if (msg->hdr.type == RPC_MSG_REQUEST)
-        rpc_handle_request(msg);
-    else if (msg->hdr.type == RPC_MSG_RESPONSE)
-        rpc_handle_response(msg);
+    msg = (struct rpc_message *)poll_buf;
 
-    free(msg);
+    flags      = ntohs(msg->hdr.flags);
+    method_len = ntohs(msg->hdr.method_len);
+
+    if ((flags & RPC_FLAG_RESPONSE) != 0 || method_len == 0) {
+        rpc_handle_response(msg, (size_t)n);
+    } else {
+        rpc_handle_request(msg, (size_t)n);
+    }
 }

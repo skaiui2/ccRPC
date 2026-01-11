@@ -1,19 +1,21 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include "rpc_methods_decl.h"
+#include "rpc_tlv.h"
+#include "rpc_gen.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include "services_shell.h"
 
-int shell_exec_handler(const void *param, struct rpc_result *r)
+
+int shell_exec_handler(const struct rpc_param_shell_exec *in,
+                       struct rpc_result_shell_exec *out)
 {
-    const struct rpc_param_shell_exec *p = param;
+    printf("NodeB: shell_exec(cmd=%s)\n",
+           in->cmd ? in->cmd : "(null)");
 
-    printf("[NodeB] shell.exec cmd=%s\n",
-           p->cmd ? p->cmd : "(null)");
-
-    static const char msg[] = "OK";
-    r->type = RPC_RESULT_STRING;
-    r->data = msg;
-    r->len  = sizeof(msg) - 1;
+    out->output = "dummy-output-from-NodeB";
+    out->exitcode = 0;
 
     return 0;
 }

@@ -1,7 +1,9 @@
-#ifndef SERVICES_FS_H
-#define SERVICES_FS_H
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+#include "rpc_gen.h"  
 
 
-int fs_read_handler(const void *param, struct rpc_result *r);
-
-#endif
+int fs_read_handler(const struct rpc_param_fs_read *in,
+                    struct rpc_result_fs_read *out);

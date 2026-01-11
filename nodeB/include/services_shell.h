@@ -1,11 +1,9 @@
 #ifndef SERVICES_SHELL_H
 #define SERVICES_SHELL_H
 
-#include "rpc_result.h"
+#include "rpc_gen.h"  
 
-int shell_exec_handler(const void *param, struct rpc_result *r);
-
-
-
+int shell_exec_handler(const struct rpc_param_shell_exec *in,
+                       struct rpc_result_shell_exec *out);
 
 #endif
