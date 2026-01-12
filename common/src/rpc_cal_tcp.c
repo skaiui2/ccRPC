@@ -2,12 +2,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-
-#include "rpc_cal_tcp.h"
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
 
 int rpc_tcp_connect(rpc_tcp_ctx_t *ctx, const char *ip, int port)
@@ -83,4 +79,13 @@ ssize_t rpc_tcp_recv(void *user, uint8_t *buf, size_t maxlen)
 {
     rpc_tcp_ctx_t *ctx = (rpc_tcp_ctx_t*)user;
     return recv(ctx->sockfd, buf, maxlen, 0);
+}
+
+void rpc_tcp_close(void *user)
+{
+    rpc_tcp_ctx_t *ctx = (rpc_tcp_ctx_t*)user;
+    if (ctx->sockfd >= 0) {
+        close(ctx->sockfd);
+        ctx->sockfd = -1;
+    }
 }

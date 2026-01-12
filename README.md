@@ -65,19 +65,17 @@ like this:
 
 ```
 skaiuijing@ubuntu:~/rpc/nodeA/build$ ./nodeA 
-NodeA: starting...
-NodeA: listening on 9001...
-NodeA: client accepted
 NodeA: fs_read(path=/etc/config, offset=0, size=128)
+NodeA: shell.exec => 0
+NodeA: output=dummy-output-from-NodeB exit=0
 ```
 
 nodeB:
 
 ```
 skaiuijing@ubuntu:~/rpc/nodeB/build$ ./nodeB 
-NodeB: starting...
-NodeB: connected to NodeA
-NodeB: rpc_call_fs_read() => 0
+NodeB: shell_exec(cmd=echo hello-from-NodeA)
+NodeB: fs.read => 0
 NodeB: len=16 eof=1
 NodeB: data=hello-from-NodeA
 ```

@@ -34,10 +34,10 @@ struct rpc_message {
     uint8_t payload[];
 };
 
-
 typedef struct {
     ssize_t (*send)(void *user, const uint8_t *buf, size_t len);
     ssize_t (*recv)(void *user, uint8_t *buf, size_t maxlen);
+    void   (*close)(void *user);
     void *user;
 } rpc_transport_t;
 
@@ -57,9 +57,12 @@ typedef int (*rpc_result_encoder_t)(
     uint8_t *out_buf,
     size_t *out_len);
 
-
 void rpc_init(void);
 void rpc_set_transport(rpc_transport_t *t);
+int  rpc_register_transport(rpc_transport_t *t);
+
+void rpc_transport_register(const char *name, rpc_transport_t *t);
+rpc_transport_t *rpc_transport_lookup(const char *name);
 
 //requester call it
 int rpc_call_with_tlv(const char *method,

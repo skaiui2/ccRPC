@@ -36,4 +36,10 @@ target_compile_definitions(nodeA PRIVATE
     RPC_METHODS_XDEF_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/include/rpc_methods_nodeA.xdef\"
 )
 
-target_link_libraries(nodeA rpc_common)
+
+find_package(Threads REQUIRED)
+
+target_link_libraries(nodeA PRIVATE
+    rpc_common
+    Threads::Threads
+)
