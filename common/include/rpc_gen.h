@@ -1,13 +1,11 @@
-#pragma once
+#ifndef RPC_GEN_H 
+#define RPC_GEN_H
 
 #include <stdint.h>
 #include <stddef.h>
 #include "rpc_tlv.h"
 #include "rpc.h"
 
-/* ============================================
- * IDL → C 类型映射
- * ============================================ */
 
 typedef char*    rpc_string_t;
 typedef uint32_t rpc_u32_t;
@@ -67,3 +65,5 @@ typedef struct {
 
 /* 只有 PROVIDER 方法会被纳入 rpc_register_all */
 void rpc_register_all(void);
+
+#endif

@@ -1,16 +1,18 @@
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+#include "rpc_time.h"
 #include "hashmap.h"
 #include "rpc.h"
 
 struct pending_call {
     uint32_t      seq;
-    uint8_t      *buf;       // 响应 TLV 存放地址（由调用方提供） 
-    size_t        buf_size;  // buf 的最大长度 
-    size_t        resp_len;  
+    uint8_t      *buf;       // 响应 TLV 存放地址（由调用方提供）
+    size_t        buf_size;  // buf 的最大长度
+    size_t        resp_len;
     rpc_status_t  status;
     int           done;
+    uint64_t deadline_ms;
 };
 
 struct rpc_method_entry {
@@ -22,11 +24,11 @@ struct rpc_method_entry {
 
 struct rpc_transport_entry {
     const char     *name;
-    rpc_transport_t *transport;
+    struct rpc_transport_class *transport;
 };
 
 static struct hashmap g_methods;
-static rpc_transport_t *g_transport = NULL;
+static struct rpc_transport_class *g_transport = NULL;
 
 static uint32_t g_next_seq = 1;
 static struct hashmap g_pending;
@@ -57,20 +59,151 @@ static uint8_t resp_tlv[RPC_MAX_RESULT_TLV_SIZE];
 // max tcp segment
 static uint8_t poll_buf[1500];
 
-static rpc_transport_t *g_transports[RPC_MAX_TRANSPORTS];
+// Every node have a seq, set by programer,We use it for route in ccnet.
+static struct rpc_transport_class *g_transports[RPC_MAX_TRANSPORTS];
 static size_t g_transport_count = 0;
 
 static uint32_t rpc_next_seq(void)
 {
     uint32_t s;
 
-    s = g_next_seq++;
-    if (g_next_seq == 0)
-        g_next_seq = 1;
+    do {
+        s = g_next_seq++;
+        if (g_next_seq == 0)
+            g_next_seq = 1;
+    } while (hashmap_contains(&g_pending, (void*)(uintptr_t)s));
+
     return s;
 }
 
-static int rpc_send_response_tlv(rpc_transport_t *t,
+static struct rpc_buf *rpc_buf_alloc(const uint8_t *data, size_t len)
+{
+    struct rpc_buf *b = malloc(sizeof(*b) + len);
+    if (!b)
+        return NULL;
+
+    list_node_init(&b->node);
+    b->len = len;
+
+    if (len > 0 && data)
+        memcpy(b->data, data, len);
+
+    return b;
+}
+
+static void rpc_reasm_append(struct rpc_reasm *r, const uint8_t *data, size_t len)
+{
+    struct rpc_buf *b;
+
+    if (!r || len == 0)
+        return;
+
+    b = rpc_buf_alloc(data, len);
+    if (!b)
+        return;
+
+    list_add_prev(&r->head, &b->node);
+    r->total_len += len;
+}
+
+/*
+ * Get a header, if the rpc_buf->len >= need,
+ * we can get a header.Other, find next.
+*/
+static int rpc_reasm_peek_header(struct rpc_reasm *r, struct rpc_header *hdr)
+{
+    size_t copied_size = 0;
+    size_t remain_size = 0;
+    size_t take = 0;
+    struct rpc_buf *b;
+    struct list_node *pos;
+
+    if (!r || !hdr)
+        return -1;
+
+    if (r->total_len < sizeof(*hdr))
+        return -1;
+
+    pos = r->head.next;
+
+    while (pos != &r->head && copied_size < sizeof(*hdr)) {
+        b = container_of(pos, struct rpc_buf, node);
+        remain_size = sizeof(*hdr) - copied_size;
+        if (remain_size > b->len) {
+            take = b->len;
+        } else {
+            take = remain_size;
+        }
+
+        memcpy((uint8_t *)hdr + copied_size, b->data, take);
+        copied_size += take;
+
+        pos = pos->next;
+    }
+
+    return (copied_size == sizeof(*hdr)) ? 0 : -1;
+}
+
+static void rpc_reasm_consume(struct rpc_reasm *r, uint8_t *out, size_t len)
+{
+    size_t copied = 0;
+    size_t remain = 0;
+    size_t take = 0;
+    struct rpc_buf *b;
+    struct list_node *pos, *n;
+
+    if (!r || len == 0)
+        return;
+
+    pos = r->head.next;
+
+    while (pos != &r->head && copied < len) {
+        b = container_of(pos, struct rpc_buf, node);
+        n = pos->next;
+
+        remain = len - copied;
+        take = b->len < remain ? b->len : remain;
+
+        if (out)
+            memcpy(out + copied, b->data, take);
+
+        copied += take;
+
+        if (take == b->len) {
+            list_remove(&b->node);
+            free(b);
+        } else {
+            memmove(b->data, b->data + take, b->len - take);
+            b->len -= take;
+            break;
+        }
+
+        pos = n;
+    }
+
+    r->total_len -= copied;
+}
+
+
+struct rpc_transport_class *rpc_trans_class_alloc(void *send, void *recv, void *close, void *user)
+{
+    struct rpc_transport_class *ret = malloc(sizeof(struct rpc_transport_class));
+    if (!ret)
+        return NULL;
+
+    ret->user  = user;
+    ret->send  = send;
+    ret->recv  = recv;
+    ret->close = close;
+
+    list_node_init(&ret->reasm.head);
+    ret->reasm.total_len = 0;
+
+    return ret;
+}
+
+
+static int rpc_send_response_tlv(struct rpc_transport_class *t,
                                  uint32_t seq,
                                  rpc_status_t status,
                                  const uint8_t *tlv, size_t tlv_len)
@@ -88,23 +221,20 @@ static int rpc_send_response_tlv(rpc_transport_t *t,
     if (!msg)
         return -1;
 
-    msg->hdr.version    = htons(RPC_VERSION_2_0);
-    msg->hdr.flags      = htons(RPC_FLAG_RESPONSE |
-                                (status != RPC_STATUS_OK ? RPC_FLAG_ERROR : 0));
+    msg->hdr.status = htons((uint16_t)status);
     msg->hdr.seq        = htonl(seq);
-    msg->hdr.method_len = htons(0);
-    msg->hdr.status     = htons((uint16_t)status);
+    msg->hdr.msg_len    = htonl((uint32_t)tlv_len);
+    msg->hdr.method_len = htons(0); 
 
     if (tlv_len > 0 && tlv)
         memcpy(msg->payload, tlv, tlv_len);
 
-    ret = (int)t->send(t->user,
-                       (const uint8_t *)msg, total);
+    ret = (int)t->send(t->user, (const uint8_t *)msg, total);
     free(msg);
     return ret;
 }
 
-static int rpc_send_request_tlv(rpc_transport_t *t,
+static int rpc_send_request_tlv(struct rpc_transport_class *t,
                                 uint32_t seq,
                                 const char *name,
                                 const uint8_t *tlv, size_t tlv_len)
@@ -114,7 +244,7 @@ static int rpc_send_request_tlv(rpc_transport_t *t,
     struct rpc_message *msg;
     int ret;
 
-    if (!t || !t->send)
+    if (!t || !t->send || !name)
         return -1;
 
     mlen  = strlen(name);
@@ -124,23 +254,22 @@ static int rpc_send_request_tlv(rpc_transport_t *t,
     if (!msg)
         return -1;
 
-    msg->hdr.version    = htons(RPC_VERSION_2_0);
-    msg->hdr.flags      = htons(0); // request 
+    msg->hdr.status = htons((uint16_t)RPC_STATUS_OK);
     msg->hdr.seq        = htonl(seq);
+    msg->hdr.msg_len    = htonl((uint32_t)(mlen + tlv_len));
     msg->hdr.method_len = htons((uint16_t)mlen);
-    msg->hdr.status     = htons(0);
 
     memcpy(msg->payload, name, mlen);
     if (tlv_len > 0 && tlv)
         memcpy(msg->payload + mlen, tlv, tlv_len);
 
-    ret = (int)t->send(t->user,
-                       (const uint8_t *)msg, total);
+    ret = (int)t->send(t->user, (const uint8_t *)msg, total);
     free(msg);
     return ret;
 }
 
-static void rpc_handle_request(rpc_transport_t *t,
+
+static void rpc_handle_request(struct rpc_transport_class *t,
                                const struct rpc_message *msg, size_t len)
 {
     size_t tmp;
@@ -153,9 +282,6 @@ static void rpc_handle_request(rpc_transport_t *t,
     size_t resp_len;
 
     if (len < sizeof(struct rpc_header))
-        return;
-
-    if (ntohs(msg->hdr.version) != RPC_VERSION_2_0)
         return;
 
     seq        = ntohl(msg->hdr.seq);
@@ -219,17 +345,12 @@ static void rpc_handle_response(const struct rpc_message *msg, size_t len)
 {
     size_t tmp;
     uint32_t seq;
-    uint16_t status;
     struct pending_call *pc;
 
     if (len < sizeof(struct rpc_header))
         return;
 
-    if (ntohs(msg->hdr.version) != RPC_VERSION_2_0)
-        return;
-
-    seq    = ntohl(msg->hdr.seq);
-    status = ntohs(msg->hdr.status);
+    seq = ntohl(msg->hdr.seq);
 
     pc = hashmap_get(&g_pending, (void *)(uintptr_t)seq);
     if (!pc)
@@ -244,8 +365,83 @@ static void rpc_handle_response(const struct rpc_message *msg, size_t len)
         memcpy(pc->buf, msg->payload, tmp);
 
     pc->resp_len = tmp;
-    pc->status   = (rpc_status_t)status;
+
+    pc->status = (rpc_status_t)ntohs(msg->hdr.status);
+
     pc->done     = 1;
+}
+
+
+static void rpc_dispatch_message(struct rpc_transport_class *t,
+                                 const uint8_t *buf, size_t len)
+{
+    const struct rpc_message *msg = (const struct rpc_message *)buf;
+    uint16_t method_len;
+
+    if (len < sizeof(struct rpc_header))
+        return;
+
+    method_len = ntohs(msg->hdr.method_len);
+    if (method_len == 0)
+        rpc_handle_response(msg, len);
+    else
+        rpc_handle_request(t, msg, len);
+}
+
+static void rpc_poll_one(struct rpc_transport_class *t)
+{
+    ssize_t n;
+    struct rpc_reasm *r;
+    struct rpc_header hdr;
+    uint32_t msg_len;
+    size_t need;
+    uint8_t *msg_buf;
+
+    if (!t || !t->recv)
+        return;
+
+    r = &t->reasm;
+
+    n = t->recv(t->user, poll_buf, sizeof(poll_buf));
+    if (n > 0)
+        rpc_reasm_append(r, poll_buf, (size_t)n);
+
+    for (;;) {
+        if (r->total_len < sizeof(struct rpc_header))
+            break;
+
+        if (rpc_reasm_peek_header(r, &hdr) < 0)
+            break;
+
+        msg_len = ntohl(hdr.msg_len);
+        need    = sizeof(struct rpc_header) + (size_t)msg_len;
+
+        if (r->total_len < need)
+            break;
+
+        msg_buf = malloc(need);
+        if (!msg_buf) {
+            rpc_reasm_consume(r, NULL, need);
+            continue;
+        }
+
+        rpc_reasm_consume(r, msg_buf, need);
+
+        rpc_dispatch_message(t, msg_buf, need);
+
+        free(msg_buf);
+    }
+}
+
+void rpc_poll(void)
+{
+    size_t i;
+    struct rpc_transport_class *t;
+
+    for (i = 0; i < g_transport_count; ++i) {
+        t = g_transports[i];
+        rpc_poll_one(t);
+    }
 }
 
 void rpc_init(void)
@@ -254,18 +450,17 @@ void rpc_init(void)
     hashmap_init(&g_pending,  64, HASHMAP_KEY_INT);
     hashmap_init(&g_transport_map,   64, HASHMAP_KEY_STRING);
     g_transport       = NULL;
-    g_next_seq        = 1;
     g_transport_count = 0;
 }
 
-void rpc_set_transport(rpc_transport_t *t)
+void rpc_set_transport(struct rpc_transport_class *t)
 {
     g_transport = t;
     if (t && g_transport_count < RPC_MAX_TRANSPORTS)
         g_transports[g_transport_count++] = t;
 }
 
-int rpc_register_transport(rpc_transport_t *t)
+int rpc_register_transport(struct rpc_transport_class *t)
 {
     if (!t)
         return -1;
@@ -275,7 +470,7 @@ int rpc_register_transport(rpc_transport_t *t)
     return 0;
 }
 
-void rpc_transport_register(const char *name, rpc_transport_t *t)
+void rpc_transport_register(const char *name, struct rpc_transport_class *t)
 {
     struct rpc_transport_entry *e;
 
@@ -292,7 +487,7 @@ void rpc_transport_register(const char *name, rpc_transport_t *t)
     hashmap_put(&g_transport_map, (void *)name, e);
 }
 
-rpc_transport_t *rpc_transport_lookup(const char *name)
+struct rpc_transport_class *rpc_transport_lookup(const char *name)
 {
     struct rpc_transport_entry *e;
 
@@ -308,7 +503,7 @@ int rpc_call_with_tlv(const char *name,
                       uint8_t *out_tlv, size_t *out_len)
 {
     uint32_t seq;
-    rpc_transport_t *t;
+    struct rpc_transport_class *t;
     struct pending_call pc;
     int r;
 
@@ -335,8 +530,18 @@ int rpc_call_with_tlv(const char *name,
         return -RPC_STATUS_TRANSPORT_ERROR;
     }
 
-    while (!pc.done)
+    uint64_t now = rpc_now_ms();
+    pc.deadline_ms = now + RPC_TIMEOUT_MS;
+
+    while (!pc.done) {
         rpc_poll();
+
+        if (rpc_now_ms() > pc.deadline_ms) {
+            pc.status = RPC_STATUS_TIMEOUT;
+            pc.done = 1;
+            break;
+        }
+    }
 
     hashmap_remove(&g_pending, (void *)(uintptr_t)seq);
 
@@ -366,44 +571,4 @@ void rpc_register_method(const char *name,
     e->encode_result = encoder;
 
     hashmap_put(&g_methods, (void *)name, e);
-}
-
-static void rpc_poll_one(rpc_transport_t *t)
-{
-    ssize_t n;
-    struct rpc_message *msg;
-    uint16_t flags;
-    uint16_t method_len;
-
-    if (!t || !t->recv)
-        return;
-
-    n = t->recv(t->user, poll_buf, sizeof(poll_buf));
-    if (n <= 0)
-        return;
-
-    if (n < (ssize_t)sizeof(struct rpc_header))
-        return;
-
-    msg = (struct rpc_message *)poll_buf;
-
-    flags      = ntohs(msg->hdr.flags);
-    method_len = ntohs(msg->hdr.method_len);
-
-    if ((flags & RPC_FLAG_RESPONSE) != 0 || method_len == 0) {
-        rpc_handle_response(msg, (size_t)n);
-    } else {
-        rpc_handle_request(t, msg, (size_t)n);
-    }
-}
-
-void rpc_poll(void)
-{
-    size_t i;
-    rpc_transport_t *t;
-
-    for (i = 0; i < g_transport_count; ++i) {
-        t = g_transports[i];
-        rpc_poll_one(t);
-    }
 }
