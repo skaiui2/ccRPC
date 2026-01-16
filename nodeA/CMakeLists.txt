@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(nodeA C)
 
+set(CMAKE_BUILD_TYPE Debug)
+
 # nodeA 源文件
 file(GLOB NODEA_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/*.c

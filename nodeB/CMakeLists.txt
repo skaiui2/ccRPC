@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(nodeB C)
 
+set(CMAKE_BUILD_TYPE Debug)
+
 file(GLOB NODEB_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/*.c
 )

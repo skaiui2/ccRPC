@@ -2,62 +2,72 @@
 #include "rpc_cal_tcp.h"
 #include "services_fs.h"
 #include "rpc_gen.h"
+#include "scp.h"
+#include "cal_udp.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include "scp_time.h"
 
-static struct rpc_transport_class *tAtoB;
-static struct rpc_transport_class *tBtoA;
+static cal_udp_ctx_t udpA;          
+static struct sockaddr_in peerB;    
+static int peerB_set = 0;
+static struct scp_transport_class scp_udp_trans;
 
-static void *poll_thread(void *arg)
+
+int scp_udp_send(void *user, const void *buf, size_t len)
 {
-    (void)arg;
-    for (;;) rpc_poll();
-    return NULL;
+    return cal_udp_send(&udpA, buf, len, &peerB);
 }
 
-static void *call_thread(void *arg)
+int scp_udp_recv(void *user, void *buf, size_t maxlen)
 {
-    (void)arg;
-    sleep(1);
+    int n = cal_udp_recv(&udpA, buf, maxlen, &peerB);
+    return n;
+}
 
-    struct rpc_param_shell_exec p = { .cmd = "echo hello-from-NodeA" };
-    struct rpc_result_shell_exec r;
-
-    int st = rpc_call_shell_exec(&p, &r);
-    printf("NodeA: shell.exec => %d\n", st);
-    if (st == 0)
-        printf("NodeA: output=%s exit=%u\n", r.output, r.exitcode);
-
-    return NULL;
+int scp_udp_close(void *user)
+{
+    cal_udp_close(&udpA);
+    return 0;
 }
 
 int main(void)
 {
-    rpc_init();
-    rpc_register_all();
+    int fd = scp_init(&scp_udp_trans, 16);
+    scp_time_init();
+    if (cal_udp_open(&udpA, "0.0.0.0", 9001) < 0) {
+        perror("NodeA udp_open");
+        return -1;
+    }
+    
+    scp_udp_trans.send  = scp_udp_send;
+    scp_udp_trans.recv  = scp_udp_recv;
+    scp_udp_trans.close = scp_udp_close;
+    scp_udp_trans.user  = NULL;
+    
+    printf("NodeA: SCP stream opened, fd=%d\n", fd);
 
-    rpc_tcp_ctx_t listener, client;
-    rpc_tcp_listen(&listener, 9001);
-    rpc_tcp_accept(&listener, &client);
+    peerB.sin_family = AF_INET;
+    peerB.sin_port   = htons(9002);
+    peerB.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    tBtoA = rpc_trans_class_alloc(rpc_tcp_send, rpc_tcp_recv, rpc_tcp_close, &client);
 
-    rpc_register_transport(tBtoA);
-    rpc_transport_register("fs.read", tBtoA);
+    uint8_t buf[2048];
+    struct sockaddr_in src;
 
-    rpc_tcp_ctx_t ctx;
-    rpc_tcp_connect(&ctx, "127.0.0.1", 9002);
+    const char *msg = "hello from NodeA";
+    for (;;) 
+    {
+        int n = scp_udp_trans.recv(&udpA, buf, sizeof(buf));
+        scp_recv(fd, buf, n);
+        uint8_t *pd = buf + sizeof(struct scp_hdr);
+        printf("NodeA get: %s, len = %d\n", pd, n);
+        cal_udp_send(&udpA, msg, strlen(msg) + 1, &peerB);
+        //scp_recv(fd, buf, (size_t)n);
+    }
 
-    tAtoB = rpc_trans_class_alloc(rpc_tcp_send, rpc_tcp_recv, rpc_tcp_close, &ctx);
-
-    rpc_register_transport(tAtoB);
-    rpc_transport_register("shell.exec", tAtoB);
-
-    pthread_t th_poll, th_call;
-    pthread_create(&th_poll, NULL, poll_thread, NULL);
-    pthread_create(&th_call, NULL, call_thread, NULL);
-
-    pthread_join(th_call, NULL);
     return 0;
 }

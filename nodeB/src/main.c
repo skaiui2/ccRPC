@@ -1,69 +1,79 @@
-#include "rpc.h"
-#include "rpc_cal_tcp.h"
-#include "services_shell.h"
-#include "rpc_gen.h"
+#include "scp.h"
+#include "cal_udp.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include "scp_time.h"
 
-static struct rpc_transport_class *tAtoB;
-static struct rpc_transport_class *tBtoA;
+static cal_udp_ctx_t udpB;     
+static struct sockaddr_in peerA;  
+static struct scp_transport_class scp_udp_trans;
 
-static void *poll_thread(void *arg)
+
+// transport: send
+int scp_udp_send(void *user, const void *buf, size_t len)
 {
-    (void)arg;
-    for (;;) rpc_poll();
-    return NULL;
+    return cal_udp_send(&udpB, buf, len, &peerA);
 }
 
-static void *call_thread(void *arg)
+// transport: recv（不使用）
+int scp_udp_recv(void *user, void *buf, size_t maxlen)
 {
-    (void)arg;
-    sleep(1);
+    int n = cal_udp_recv(&udpB, buf, maxlen, &peerA);
+    return n;
+}
 
-    struct rpc_param_fs_read p = {
-        .path   = "/etc/config",
-        .offset = 0,
-        .size   = 128
-    };
-    struct rpc_result_fs_read r;
-
-    int st = rpc_call_fs_read(&p, &r);
-    printf("NodeB: fs.read => %d\n", st);
-    if (st == 0) {
-        printf("NodeB: len=%u eof=%u\n", (unsigned)r.len, (unsigned)r.eof);
-        printf("NodeB: data=%.*s\n", (int)r.data.len, (char*)r.data.ptr);
-    }
-
-    return NULL;
+// transport: close
+int scp_udp_close(void *user)
+{
+    cal_udp_close(&udpB);
+    return 0;
 }
 
 int main(void)
 {
-    rpc_init();
-    rpc_register_all();
+    int fd = scp_init(&scp_udp_trans, 16);
+    scp_time_init();
+    if (cal_udp_open(&udpB, "0.0.0.0", 9002) < 0) {
+        perror("NodeB udp_open");
+        return -1;
+    }
 
-    rpc_tcp_ctx_t ctx;
-    rpc_tcp_connect(&ctx, "127.0.0.1", 9001);
+    memset(&peerA, 0, sizeof(peerA));
+    peerA.sin_family = AF_INET;
+    peerA.sin_port   = htons(9001);
+    peerA.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    tBtoA = rpc_trans_class_alloc(rpc_tcp_send, rpc_tcp_recv, rpc_tcp_close, &ctx);
+    scp_udp_trans.send  = scp_udp_send;
+    scp_udp_trans.recv  = scp_udp_recv;
+    scp_udp_trans.close = scp_udp_close;
+    scp_udp_trans.user  = NULL;
 
-    rpc_register_transport(tBtoA);
-    rpc_transport_register("fs.read", tBtoA);
+    printf("NodeB: SCP stream opened, fd=%d\n", fd);
 
-    rpc_tcp_ctx_t listener, client;
-    rpc_tcp_listen(&listener, 9002);
-    rpc_tcp_accept(&listener, &client);
+    const char *msg = "hello from NodeB";
+    printf("NodeB send: %s\n", msg);
 
-    tAtoB = rpc_trans_class_alloc(rpc_tcp_send, rpc_tcp_recv, rpc_tcp_close, &client);
+    uint8_t buf[2048];
+    struct sockaddr_in src;
+    
 
-    rpc_register_transport(tAtoB);
-    rpc_transport_register("shell.exec", tAtoB);
+    for (;;) 
+    {
+        int len = strlen(msg) + 1;
+        scp_send(fd, (void *)msg, len);
+        int n = cal_udp_recv(&udpB, buf, sizeof(buf), &src);
+        /*
+        if (n > 0) {
+            scp_recv(fd, buf, (size_t)n);
+        }
+        */
 
-    pthread_t th_poll, th_call;
-    pthread_create(&th_poll, NULL, poll_thread, NULL);
-    pthread_create(&th_call, NULL, call_thread, NULL);
+        printf("NodeB get: %s\n", buf);
 
-    pthread_join(th_call, NULL);
+    }
+
     return 0;
 }

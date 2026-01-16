@@ -59,7 +59,6 @@ static uint8_t resp_tlv[RPC_MAX_RESULT_TLV_SIZE];
 // max tcp segment
 static uint8_t poll_buf[1500];
 
-// Every node have a seq, set by programer,We use it for route in ccnet.
 static struct rpc_transport_class *g_transports[RPC_MAX_TRANSPORTS];
 static size_t g_transport_count = 0;
 
