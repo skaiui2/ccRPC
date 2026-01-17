@@ -6,6 +6,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
+#include <fcntl.h>
+#include <errno.h>
+
 int cal_udp_open(cal_udp_ctx_t *ctx, const char *bind_ip, uint16_t bind_port)
 {
     if (!ctx) return -1;
@@ -67,8 +70,11 @@ int cal_udp_recv(cal_udp_ctx_t *ctx,
     socklen_t slen = sizeof(struct sockaddr_in);
     ssize_t n = recvfrom(ctx->sockfd, buf, maxlen, 0,
                          (struct sockaddr*)src, &slen);
-    if (n < 0) {
-        perror("udp recvfrom");
+    if (n < 0) { 
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { 
+            return 0; 
+        } 
+        perror("udp recvfrom"); 
         return -1;
     }
     return (int)n;

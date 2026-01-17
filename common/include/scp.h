@@ -5,7 +5,12 @@
 #include <stddef.h>
 #include "link_list.h"
 
-#define SCP_RTO_MIN 20   
+
+#define MIN_SEG 64
+#define SCP_RTO_MIN 20  
+#define SCP_RECV_LIMIT 0xFFFF
+#define SEND_WIN_INIT 0xFFFF
+#define RECV_WIN_INIT     0xFFFF 
 #define MTU 1500
 
 
@@ -40,14 +45,18 @@ struct scp_hdr {
 #define SCP_FLAG_PING  0x10
 #define SCP_FLAG_RESEND 0x20
 
-#define TIMER_COUNT 2
+#define TIMER_RETRANS 0 
+#define TIMER_KEEPALIVE 1 
+#define TIMER_PERSIST 2 
+#define TIMER_COUNT 3
+
 struct scp_stream {
     struct list_node node;
     struct scp_transport_class *st_class;
     uint32_t timer[TIMER_COUNT];
 
-    uint32_t dst_fd;
-    uint32_t src_fd;
+    uint8_t dst_fd;
+    uint8_t src_fd;
 
     uint32_t snd_una;
     uint32_t snd_nxt;
@@ -62,7 +71,10 @@ struct scp_stream {
     uint32_t srtt;
     uint32_t rttvar;
     uint32_t rto;
+
     uint32_t rtt_ts;
+    uint32_t rtt_seq; //sequence number being timed 
+
     uint8_t  timeout_count;
 
     struct list_node snd_q;
@@ -71,6 +83,9 @@ struct scp_stream {
     struct list_node rcv_data_q; // orider
     uint32_t sb_hiwat;
     uint32_t sb_cc;
+
+    uint32_t persist_backoff;  // persist 退避
+    uint8_t  zero_wnd;         // 当前是否处于零窗口状态
 
     uint32_t timestamp;
     int state;
@@ -100,7 +115,10 @@ struct scp_stream {
 #define imin(a, b) ((int)(a) < (int)(b) ? (int)(a) : (int)(b))
 
 
-int scp_init(struct scp_transport_class *st_class, size_t max_streams);
+int scp_init(size_t max_streams);
+struct scp_stream *scp_stream_alloc(struct scp_transport_class *st_class, int src_fd, int dst_fd);
+int scp_stream_free(struct scp_stream *ss);
+
 int scp_input(int fd, void *buf, size_t len);
 int scp_send(int fd, void *buf, size_t len);
 int scp_recv(int fd, void *buf, size_t len);

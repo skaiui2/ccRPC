@@ -19,7 +19,7 @@ static void *scp_time_thread(void *arg)
     memset(&its, 0, sizeof(its));
 
     its.it_interval.tv_sec = 0;
-    its.it_interval.tv_nsec = 1 * 1000 * 1000;  // 1ms
+    its.it_interval.tv_nsec = 20 * 1000 * 1000;  // 1ms
 
     its.it_value.tv_sec = 0;
     its.it_value.tv_nsec = 1 * 1000 * 1000;
