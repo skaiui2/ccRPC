@@ -1,153 +1,65 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
 #include "ccnet.h"
+#include "cal_udp.h"
 
-static void test_simple()
+static cal_udp_ctx_t udpC;
+static struct sockaddr_in peerB;   // C -> B
+static struct sockaddr_in fromA;   // A -> C 来源
+
+int C_send(void *user, void *buf, size_t len)
 {
-    printf("\n=== Test 1: Simple graph ===\n");
-
-    ccnet_graph g;
-    ccnet_graph_init(&g, 4);
-
-    ccnet_graph_set_edge(&g, 0, 1, 1);
-    ccnet_graph_set_edge(&g, 1, 2, 20);
-    ccnet_graph_set_edge(&g, 2, 3, 1);
-    ccnet_graph_set_edge(&g, 0, 3, 2);
-    ccnet_graph_set_edge(&g, 3, 2, 1);
-
-    int nh = ccnet_next_hop(&g, 0, 2);
-    printf("next hop from 0 to 2 = %d (expected 3)\n", nh);
+    return cal_udp_send(&udpC, buf, len, &peerB);
 }
 
-static void test_symmetric()
+int C_recv(void *user, void *buf, size_t maxlen)
 {
-    printf("\n=== Test 2: Symmetric graph ===\n");
-
-    ccnet_graph g;
-    ccnet_graph_init(&g, 4);
-
-    ccnet_graph_set_edge(&g, 0,1,1);
-    ccnet_graph_set_edge(&g, 1,0,1);
-    ccnet_graph_set_edge(&g, 1,2,1);
-    ccnet_graph_set_edge(&g, 2,1,1);
-    ccnet_graph_set_edge(&g, 2,3,1);
-    ccnet_graph_set_edge(&g, 3,2,1);
-
-    int nh = ccnet_next_hop(&g, 0, 3);
-    printf("next hop from 0 to 3 = %d (expected 1)\n", nh);
+    return cal_udp_recv(&udpC, buf, maxlen, &fromA);
 }
 
-static void test_asymmetric()
+int C_close(void *user)
 {
-    printf("\n=== Test 3: Asymmetric graph ===\n");
-
-    ccnet_graph g;
-    ccnet_graph_init(&g, 4);
-
-    ccnet_graph_set_edge(&g, 0,1,1);
-    ccnet_graph_set_edge(&g, 1,2,1);
-    ccnet_graph_set_edge(&g, 2,3,1);
-    ccnet_graph_set_edge(&g, 3,0,100);
-
-    int nh = ccnet_next_hop(&g, 3, 2);
-    printf("next hop from 3 to 2 = %d (expected 0)\n", nh);
-}
-
-static void test_unreachable()
-{
-    printf("\n=== Test 4: Unreachable graph ===\n");
-
-    ccnet_graph g;
-    ccnet_graph_init(&g, 4);
-
-    ccnet_graph_set_edge(&g, 0,1,1);
-    ccnet_graph_set_edge(&g, 1,0,1);
-
-    ccnet_graph_set_edge(&g, 2,3,1);
-    ccnet_graph_set_edge(&g, 3,2,1);
-
-    int nh = ccnet_next_hop(&g, 0, 3);
-    printf("next hop from 0 to 3 = %d (expected -1)\n", nh);
-}
-
-static void test_loop()
-{
-    printf("\n=== Test 5: Loop graph ===\n");
-
-    ccnet_graph g;
-    ccnet_graph_init(&g, 3);
-
-    ccnet_graph_set_edge(&g, 0,1,1);
-    ccnet_graph_set_edge(&g, 1,2,1);
-    ccnet_graph_set_edge(&g, 2,0,1);
-
-    int nh = ccnet_next_hop(&g, 0, 2);
-    printf("next hop from 0 to 2 = %d (expected 1)\n", nh);
-}
-
-static void test_equal_paths()
-{
-    printf("\n=== Test 6: Equal-cost multipath ===\n");
-
-    ccnet_graph g;
-    ccnet_graph_init(&g, 4);
-
-    ccnet_graph_set_edge(&g, 0,1,1);
-    ccnet_graph_set_edge(&g, 1,3,1);
-    ccnet_graph_set_edge(&g, 0,2,1);
-    ccnet_graph_set_edge(&g, 2,3,1);
-
-    int nh = ccnet_next_hop(&g, 0, 3);
-    printf("next hop from 0 to 3 = %d (expected 1 or 2)\n", nh);
-}
-
-static void test_extreme_weights()
-{
-    printf("\n=== Test 7: Extreme weights ===\n");
-
-    ccnet_graph g;
-    ccnet_graph_init(&g, 4);
-
-    ccnet_graph_set_edge(&g, 0,1,1);
-    ccnet_graph_set_edge(&g, 1,2,10000);
-    ccnet_graph_set_edge(&g, 0,3,2);
-    ccnet_graph_set_edge(&g, 3,2,1);
-
-    int nh = ccnet_next_hop(&g, 0, 2);
-    printf("next hop from 0 to 2 = %d (expected 3)\n", nh);
-}
-
-static void test_random()
-{
-    printf("\n=== Test 8: Random stress test ===\n");
-
-    srand(time(NULL));
-
-    for (int t = 0; t < 10; t++) {
-        ccnet_graph g;
-        ccnet_graph_init(&g, 6);
-
-        for (int i = 0; i < 6; i++)
-            for (int j = 0; j < 6; j++)
-                if (i != j && rand() % 3 == 0)
-                    ccnet_graph_set_edge(&g, i, j, rand() % 20 + 1);
-
-        int nh = ccnet_next_hop(&g, 0, 5);
-        printf("random test %d: next hop = %d\n", t, nh);
-    }
+    cal_udp_close(&udpC);
+    return 0;
 }
 
 int main(void)
 {
-    test_simple();
-    test_symmetric();
-    test_asymmetric();
-    test_unreachable();
-    test_loop();
-    test_equal_paths();
-    test_extreme_weights();
-    test_random();
+    printf("[C] 启动\n");
+
+    if (cal_udp_open(&udpC, "0.0.0.0", 9002) < 0) {
+        perror("udp_open");
+        return -1;
+    }
+
+    peerB.sin_family      = AF_INET;
+    peerB.sin_port        = htons(9003);
+    peerB.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    ccnet_init(1, 16);
+
+    struct ccnet_transport_class *ctc =
+        ccnet_tran_class_alloc(C_send, C_recv, C_close, NULL);
+    ccnet_trans_class_register(2, ctc);   // 下一跳 B=2
+
+    // 全局拓扑
+    ccnet_graph_set_edge(0, 1, 1);
+    ccnet_graph_set_edge(1, 2, 1);
+    ccnet_recompute_effective_graph();
+
+    printf("[C] 等待 A 的数据...\n");
+
+    uint8_t buf[2048];
+    while (1) {
+        int n = C_recv(NULL, buf, sizeof(buf));
+        if (n > 0) {
+            printf("[C] 收到来自 A 的 UDP 包，len=%d\n", n);
+            ccnet_input(NULL, buf, n);
+        }
+    }
 
     return 0;
 }

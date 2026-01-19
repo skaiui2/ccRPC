@@ -597,8 +597,7 @@ int scp_input(int fd, void *buf, size_t len)
     sh = (struct scp_hdr *)sb->data;
 
     uint16_t calc = in_checksum(buf, len); 
-    //In internet checksum, one mod algorithm, 0 equl 0xFF.
-    if (calc != 0 && calc != 0xFF) { 
+    if (calc != 0) { 
         scp_buf_free(sb); 
         pthread_mutex_unlock(&scp_lock);
         return -1; 
