@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdint.h>
 
-#define RPC_TIMEOUT_MS 1000
+#define RPC_TIMEOUT_MS 5000
 
 static inline uint64_t rpc_now_ms(void)
 {

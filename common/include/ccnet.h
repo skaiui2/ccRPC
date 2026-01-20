@@ -50,18 +50,14 @@ struct ccnet_send_parameter {
     uint8_t type;
 };
 
-struct ccnet_transport_class {
-    int (*send)(void *user, void *data, size_t len);
-    int (*recv)(void *user, void *data, size_t maxlen);
-    int (*close)(void *user);
-    void *user;
-};
+typedef int (*ccnet_link_t)(void *ctx, void *data, size_t len);
 
 int ccnet_init(uint32_t src, uint32_t max_len);
 void ccnet_graph_set_edge(int u, int v, int w);
+
+int ccnet_register_node_link(uint32_t node_id, void *fun);
 void ccnet_recompute_effective_graph(void);
-struct ccnet_transport_class *ccnet_tran_class_alloc(void *send, void *recv, void *close, void *user);
-int ccnet_trans_class_register(uint32_t node_id, struct ccnet_transport_class *ctc);
+
 
 int ccnet_input(void *ctx, void *data, int len);
 

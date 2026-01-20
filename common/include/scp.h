@@ -6,7 +6,7 @@
 #include "link_list.h"
 
 
-#define MIN_SEG 64
+#define MIN_SEG 32
 #define SCP_RTO_MIN 20  
 #define SCP_RECV_LIMIT 0xFFFF
 #define SEND_WIN_INIT 0xFFFF
@@ -119,7 +119,8 @@ int scp_init(size_t max_streams);
 struct scp_stream *scp_stream_alloc(struct scp_transport_class *st_class, int src_fd, int dst_fd);
 int scp_stream_free(struct scp_stream *ss);
 
-int scp_input(int fd, void *buf, size_t len);
+
+int scp_input(void *ctx, void *buf, size_t len);
 int scp_send(int fd, void *buf, size_t len);
 int scp_recv(int fd, void *buf, size_t len);
 void scp_close(int fd);

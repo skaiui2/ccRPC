@@ -1,64 +1,95 @@
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-
+#include <string.h>
+#include <errno.h>
+#include <stdint.h>
 #include "ccnet.h"
-#include "cal_udp.h"
+#include "mq_posix.h"
 
-static cal_udp_ctx_t udpC;
-static struct sockaddr_in peerB;   // C -> B
-static struct sockaddr_in fromA;   // A -> C 来源
+#define NODE_ID_A 0
+#define NODE_ID_C 1
+#define NODE_ID_B 2
 
-int C_send(void *user, void *buf, size_t len)
+#define MQ_A_TO_C   "/mq_AtoC"
+#define MQ_C_TO_A   "/mq_CtoA"
+#define MQ_B_TO_C   "/mq_BtoC"
+#define MQ_C_TO_B   "/mq_CtoB"
+
+static int mq_from_A = -1;
+static int mq_to_A   = -1;
+static int mq_from_B = -1;
+static int mq_to_B   = -1;
+
+static void debug_hex(const char *tag, const void *buf, size_t len)
 {
-    return cal_udp_send(&udpC, buf, len, &peerB);
+    const uint8_t *p = buf;
+    printf("---- %s (%zu bytes) ----\n", tag, len);
+    for (size_t i = 0; i < len; i++) {
+        printf("%02X ", p[i]);
+        if ((i + 1) % 16 == 0) printf("\n");
+    }
+    if (len % 16 != 0) printf("\n");
+    printf("-----------------------------\n");
 }
 
-int C_recv(void *user, void *buf, size_t maxlen)
+int C_send_to_A(void *ctx, void *data, size_t len)
 {
-    return cal_udp_recv(&udpC, buf, maxlen, &fromA);
+    printf("\n[C][TX→A] len=%zu\n", len);
+    debug_hex("TX Packet", data, len);
+    int ret = mqposix_send(mq_to_A, data, len);
+    if (ret < 0) perror("[C] send_to_A");
+    return ret;
 }
 
-int C_close(void *user)
+int C_send_to_B(void *ctx, void *data, size_t len)
 {
-    cal_udp_close(&udpC);
+    printf("\n[C][TX→B] len=%zu\n", len);
+    debug_hex("TX Packet", data, len);
+    int ret = mqposix_send(mq_to_B, data, len);
+    if (ret < 0) perror("[C] send_to_B");
+    return ret;
+}
+
+int C_ccnet_recv(void *user, void *buf, size_t maxlen)
+{
+    int nA = mqposix_recv(mq_from_A, buf, maxlen);
+    if (nA > 0) return nA;
+
+    int nB = mqposix_recv(mq_from_B, buf, maxlen);
+    if (nB > 0) return nB;
+
     return 0;
 }
 
 int main(void)
 {
-    printf("[C] 启动\n");
+    mq_from_A = mqposix_open_receiver(MQ_A_TO_C);
+    mq_to_A   = mqposix_open_sender(MQ_C_TO_A);
 
-    if (cal_udp_open(&udpC, "0.0.0.0", 9002) < 0) {
-        perror("udp_open");
-        return -1;
-    }
+    mq_from_B = mqposix_open_receiver(MQ_B_TO_C);
+    mq_to_B   = mqposix_open_sender(MQ_C_TO_B);
 
-    peerB.sin_family      = AF_INET;
-    peerB.sin_port        = htons(9003);
-    peerB.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (mq_from_A < 0 || mq_to_A < 0 || mq_from_B < 0 || mq_to_B < 0)
+        return 1;
 
-    ccnet_init(1, 16);
+    ccnet_init(NODE_ID_C, 16);
 
-    struct ccnet_transport_class *ctc =
-        ccnet_tran_class_alloc(C_send, C_recv, C_close, NULL);
-    ccnet_trans_class_register(2, ctc);   // 下一跳 B=2
+    ccnet_register_node_link(NODE_ID_A, C_send_to_A);
+    ccnet_register_node_link(NODE_ID_B, C_send_to_B);
 
-    // 全局拓扑
-    ccnet_graph_set_edge(0, 1, 1);
-    ccnet_graph_set_edge(1, 2, 1);
+    ccnet_graph_set_edge(NODE_ID_A, NODE_ID_C, 1);
+    ccnet_graph_set_edge(NODE_ID_C, NODE_ID_A, 1);
+    ccnet_graph_set_edge(NODE_ID_C, NODE_ID_B, 1);
+    ccnet_graph_set_edge(NODE_ID_B, NODE_ID_C, 1);
+
     ccnet_recompute_effective_graph();
 
-    printf("[C] 等待 A 的数据...\n");
+    uint8_t buf[256];
 
-    uint8_t buf[2048];
-    while (1) {
-        int n = C_recv(NULL, buf, sizeof(buf));
-        if (n > 0) {
-            printf("[C] 收到来自 A 的 UDP 包，len=%d\n", n);
-            ccnet_input(NULL, buf, n);
-        }
+    for (;;) {
+        int n = C_ccnet_recv(NULL, buf, sizeof(buf));
+        if (n > 0) ccnet_input(NULL, buf, n);
+        usleep(1000);
     }
 
     return 0;

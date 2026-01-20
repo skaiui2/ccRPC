@@ -26,23 +26,23 @@ static void scp_debug_hex(const char *tag, const void *buf, size_t len)
     printf("-----------------------------\n");
 }
 
-int a = 0;
+static int a = 0;
 static void scp_debug_dump_tx(const char *reason,
                               const void *buf, size_t len)
 {
-/*
+
     printf("\n[SCP TX] %s, a:%d\n", reason, a++);
     scp_debug_hex("TX Packet", buf, len); 
-*/
+
 }
 
-int b = 0;
+static int b = 0;
 static void scp_debug_dump_rx(const void *buf, size_t len)
 {
-/*
+
     printf("\n[SCP RX] %d\n", b++);
     scp_debug_hex("RX Packet", buf, len);
-*/
+
 }
 
 
@@ -281,6 +281,12 @@ static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
     uint32_t seq = ntohl(sh->seq);
     uint32_t payload_len = sb->len - sizeof(struct scp_hdr);
     sb->seq = seq;
+
+    if (SEQ_LT(seq, s->rcv_nxt)) { 
+        scp_output(s, SCP_FLAG_ACK); 
+        scp_buf_free(sb); 
+        return; 
+    }
 
     if (SEQ_EQ(seq, s->rcv_nxt)) {
         s->rcv_nxt += payload_len;
@@ -576,7 +582,7 @@ int scp_send(int fd, void *buf, size_t len)
     return 0;
 }
 
-int scp_input(int fd, void *buf, size_t len)
+int scp_input(void *ctx, void *buf, size_t len)
 {
     pthread_mutex_lock(&scp_lock); 
 

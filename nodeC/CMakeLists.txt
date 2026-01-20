@@ -20,6 +20,8 @@ target_include_directories(rpc_common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
 )
 
+target_link_libraries(rpc_common PUBLIC rt)
+
 add_executable(nodeC
     ${NODEC_SRC}
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/src/rpc_gen.c
@@ -39,4 +41,5 @@ find_package(Threads REQUIRED)
 target_link_libraries(nodeC PRIVATE
     rpc_common
     Threads::Threads
+    rt
 )

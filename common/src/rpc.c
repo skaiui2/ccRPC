@@ -62,6 +62,60 @@ static uint8_t poll_buf[1500];
 static struct rpc_transport_class *g_transports[RPC_MAX_TRANSPORTS];
 static size_t g_transport_count = 0;
 
+
+
+static void ccnet_debug_hex(const char *tag, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+
+    printf("---- %s (%zu bytes) ----\n", tag, len);
+
+    for (size_t i = 0; i < len; i++) {
+        printf("%02X ", p[i]);
+        if ((i + 1) % 16 == 0)
+            printf("\n");
+    }
+    if (len % 16 != 0)
+        printf("\n");
+
+    printf("-----------------------------\n");
+}
+
+static int rpc_tx_req_id = 0;
+
+void rpc_debug_dump_tx_request(const char *name,
+                               uint32_t seq,
+                               const void *buf, size_t len)
+{
+/*
+    printf("\n[RPC TX] REQUEST name=%s seq=%u id:%d\n",
+           name, seq, rpc_tx_req_id++);
+    ccnet_debug_hex("RPC Request", buf, len);
+*/
+}
+
+static int rpc_tx_resp_id = 0;
+
+void rpc_debug_dump_tx_response(uint32_t seq,
+                                uint16_t status,
+                                const void *buf, size_t len)
+{
+/*
+    printf("\n[RPC TX] RESPONSE seq=%u status=%u id:%d\n",
+           seq, status, rpc_tx_resp_id++);
+    ccnet_debug_hex("RPC Response", buf, len);
+*/
+}
+
+static int rpc_rx_id = 0;
+
+void rpc_debug_dump_rx(const void *buf, size_t len)
+{
+    printf("\n[RPC RX] id:%d\n", rpc_rx_id++);
+    ccnet_debug_hex("RPC RX", buf, len);
+}
+
+
 static uint32_t rpc_next_seq(void)
 {
     uint32_t s;
@@ -228,6 +282,7 @@ static int rpc_send_response_tlv(struct rpc_transport_class *t,
     if (tlv_len > 0 && tlv)
         memcpy(msg->payload, tlv, tlv_len);
 
+    rpc_debug_dump_tx_response(seq, status, msg, total);
     ret = (int)t->send(t->user, (const uint8_t *)msg, total);
     free(msg);
     return ret;
@@ -262,6 +317,7 @@ static int rpc_send_request_tlv(struct rpc_transport_class *t,
     if (tlv_len > 0 && tlv)
         memcpy(msg->payload + mlen, tlv, tlv_len);
 
+    rpc_debug_dump_tx_request(name, seq, msg, total);
     ret = (int)t->send(t->user, (const uint8_t *)msg, total);
     free(msg);
     return ret;
@@ -374,6 +430,8 @@ static void rpc_handle_response(const struct rpc_message *msg, size_t len)
 static void rpc_dispatch_message(struct rpc_transport_class *t,
                                  const uint8_t *buf, size_t len)
 {
+    rpc_debug_dump_rx(buf, len);
+
     const struct rpc_message *msg = (const struct rpc_message *)buf;
     uint16_t method_len;
 
@@ -540,6 +598,7 @@ int rpc_call_with_tlv(const char *name,
             pc.done = 1;
             break;
         }
+
     }
 
     hashmap_remove(&g_pending, (void *)(uintptr_t)seq);

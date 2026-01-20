@@ -14,7 +14,7 @@ struct ccnet_private {
     uint32_t ccnet_ping_ts[CCNET_MAX_NODES];
     uint32_t ccnet_ping_timeout_count[CCNET_MAX_NODES]; 
     uint32_t timer[TIMER_COUNT];
-    struct hashmap ccnet_trans_class_map;
+    struct hashmap ccnet_trans_fun_map;
     uint16_t src;
 };
 
@@ -22,6 +22,43 @@ static struct ccnet_private *ccnet_pri;
 static uint32_t ccnet_clock = 0;
 
 void ccnet_recompute_effective_graph(void);
+
+static void ccnet_debug_hex(const char *tag, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+
+    printf("---- %s (%zu bytes) ----\n", tag, len);
+
+    for (size_t i = 0; i < len; i++) {
+        printf("%02X ", p[i]);
+        if ((i + 1) % 16 == 0)
+            printf("\n");
+    }
+    if (len % 16 != 0)
+        printf("\n");
+
+    printf("-----------------------------\n");
+}
+
+
+static int a = 0;
+static void ccnet_debug_dump_tx(const char *reason,
+                              const void *buf, size_t len)
+{
+/*
+    printf("\n[ccnet TX] %s, a:%d\n", reason, a++);
+    ccnet_debug_hex("TX Packet", buf, len); 
+*/
+}
+
+static int b = 0;
+static void ccnet_debug_dump_rx(const void *buf, size_t len)
+{
+/*
+    printf("\n[ccnet RX] %d\n", b++);
+    ccnet_debug_hex("RX Packet", buf, len);
+*/
+}
 
 void ccnet_graph_init(struct ccnet_graph *g, int n)
 {
@@ -145,18 +182,6 @@ int ccnet_next_hop(struct ccnet_graph *g, int src, int dst)
     return cur;
 }
 
-struct ccnet_transport_class *ccnet_tran_class_alloc(void *send, void *recv, void *close, void *user)
-{
-    struct ccnet_transport_class *ctc = malloc(sizeof(struct ccnet_transport_class));
-    if (!ctc) {
-        return NULL;
-    }
-    ctc->send = send;
-    ctc->recv = recv;
-    ctc->close = close;
-    ctc->user = user;
-    return ctc;
-}
 
 int ccnet_init(uint32_t src, uint32_t max_len)
 {
@@ -174,8 +199,7 @@ int ccnet_init(uint32_t src, uint32_t max_len)
     cp->src = src;
     cp->timer[TIMER_UPDATE_PING] = CCNET_UPDATE_PERIOD;
 
-
-    hashmap_init(&cp->ccnet_trans_class_map, max_len, HASHMAP_KEY_INT);
+    hashmap_init(&cp->ccnet_trans_fun_map, max_len, HASHMAP_KEY_INT);
 
     ccnet_graph_init(&cp->g_base, CCNET_MAX_NODES);
     ccnet_graph_init(&cp->g_eff, CCNET_MAX_NODES);
@@ -184,20 +208,20 @@ int ccnet_init(uint32_t src, uint32_t max_len)
     return 0;
 }
 
-int ccnet_trans_class_register(uint32_t node_id, struct ccnet_transport_class *ctc)
+int ccnet_register_node_link(uint32_t node_id, void *fun)
 {
-    hashmap_put(&ccnet_pri->ccnet_trans_class_map, node_id, ctc);
+    hashmap_put(&ccnet_pri->ccnet_trans_fun_map, node_id, fun);
     return 0;
 }
 
 void ccnet_output_data(uint16_t dst, void *data, uint16_t len)
 {
-    struct ccnet_transport_class *ctc = hashmap_get(&ccnet_pri->ccnet_trans_class_map, dst);
-    if (!ctc || !ctc->send) {
+    ccnet_link_t clt = hashmap_get(&ccnet_pri->ccnet_trans_fun_map, dst);
+    if (!clt) {
         return;
     }
-
-    ctc->send(ctc->user, (void *)data, len);
+    ccnet_debug_dump_tx("CCNET_OUT", data, len);
+    clt(NULL, (void *)data, len);
 }
 
 
@@ -319,12 +343,12 @@ void ccnet_process_data(void *data)
 {
     void *payload_data = (void *)(((struct ccnet_hdr *)data) + 1);
     uint16_t payload_len = ntohs(((struct ccnet_hdr *)data)->len);
-    struct ccnet_transport_class *ctc = hashmap_get(&ccnet_pri->ccnet_trans_class_map, ccnet_pri->src);
-    if (!ctc || !ctc->recv) { 
+    ccnet_link_t clt = hashmap_get(&ccnet_pri->ccnet_trans_fun_map, ccnet_pri->src);
+    if (!clt) { 
         return; 
     }
 
-    ctc->recv(ctc->user, payload_data, payload_len);
+    clt(NULL, payload_data, payload_len);
 }
 
 
@@ -342,6 +366,7 @@ int ccnet_input(void *ctx, void *data, int len)
         return -1; 
     }
 
+    ccnet_debug_dump_rx(data, len);
     uint16_t src = ntohs(ch->src);
     uint16_t dst = ntohs(ch->dst);
     ch->ttl--;
