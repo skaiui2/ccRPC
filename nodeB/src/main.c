@@ -7,7 +7,7 @@
 #include "ccnet.h"
 #include "mq_posix.h"
 #include "scp_time.h"
-
+/*
 #define NODE_ID_A 0
 #define NODE_ID_C 1
 #define NODE_ID_B 2
@@ -186,5 +186,154 @@ printf("[C] MQ_B_TO_C = '%s'\n", MQ_B_TO_C);
     for (;;)
         pause();
 
+    return 0;
+}
+*/
+
+#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <string.h>
+#include "cal_udp.h"
+#include "scp.h"
+
+#define RECV_BUF 2048
+#define TEST_FILE_SIZE (10*1024 * 1024)
+
+struct scp_udp_user {
+    cal_udp_ctx_t *udp;
+    struct sockaddr_in peer;
+};
+
+static int scp_udp_send(void *user, const void *buf, size_t len)
+{
+    struct scp_udp_user *u = user;
+    return cal_udp_send(u->udp, buf, len, &u->peer);
+}
+
+int main()
+{
+    printf("[B] full-duplex test, expecting %d bytes...\n", TEST_FILE_SIZE);
+
+    int gen = open("testB.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    for (size_t i = 0; i < TEST_FILE_SIZE; i++) {
+        uint8_t b = (i * 7) % 256;
+        write(gen, &b, 1);
+    }
+    close(gen);
+
+    int fd_send = open("testB.bin", O_RDONLY);
+    int fd_recv = open("outB.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    cal_udp_ctx_t udp;
+    cal_udp_open(&udp, "127.0.0.1", 6000);
+
+    int fl = fcntl(udp.sockfd, F_GETFL, 0);
+    fcntl(udp.sockfd, F_SETFL, fl | O_NONBLOCK);
+    srand(time(NULL));
+
+    scp_init(16);
+
+    struct scp_udp_user user;
+    user.udp = &udp;
+    user.peer.sin_family = AF_INET;
+    user.peer.sin_port   = htons(5000);
+    user.peer.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    struct scp_transport_class st = {
+        .user  = &user,
+        .send  = scp_udp_send,
+        .recv  = NULL,
+        .close = NULL
+    };
+
+    uint8_t sendbuf[RECV_BUF];
+    uint8_t recvbuf[RECV_BUF];
+    uint8_t rxbuf[RECV_BUF];
+    struct sockaddr_in src;
+
+    size_t sent = 0;
+    size_t received = 0;
+
+    struct scp_stream *ss = scp_stream_alloc(&st, 1, 1);
+
+    printf("[B] waiting ESTABLISHED...\n");
+    while (ss->state != SCP_ESTABLISHED) {
+        scp_timer_process();
+        int rn = cal_udp_recv(&udp, rxbuf, sizeof(rxbuf), &src);
+        if (rn > 0) scp_input(ss, rxbuf, rn);
+        usleep(1000);
+    }
+
+    printf("[B] ESTABLISHED, start full-duplex...\n");
+
+    ssize_t cur_len = 0;
+    size_t  cur_off = 0;
+    int     have_pending = 0;
+
+    while (1) {
+        scp_timer_process();
+
+        int rn = cal_udp_recv(&udp, rxbuf, sizeof(rxbuf), &src);
+        if (rn > 0) scp_input(ss, rxbuf, rn);
+
+        /* 1. 没有挂起数据且还没发完，就读一批 */
+        if (!have_pending && sent < TEST_FILE_SIZE) {
+            cur_len = read(fd_send, sendbuf, sizeof(sendbuf));
+            if (cur_len > 0) {
+                cur_off = 0;
+                have_pending = 1;
+            } else {
+                have_pending = 0;
+            }
+        }
+
+        /* 2. 发送挂起数据 */
+        if (have_pending) {
+            int ret = scp_send(1, sendbuf + cur_off, (size_t)cur_len - cur_off);
+            if (ret == 0) {
+                sent += (size_t)cur_len;
+                have_pending = 0;
+            } else if (ret == -2) {
+                /* 窗口满，等下一轮 */
+            } else {
+                goto out;
+            }
+        }
+
+        /* 3. 接收对端数据 */
+        int n = scp_recv(1, recvbuf, sizeof(recvbuf));
+        if (n > 0) {
+            write(fd_recv, recvbuf, n);
+            received += (size_t)n;
+        }
+
+        /* 4. 双向完成后再 FIN */
+        if (sent == TEST_FILE_SIZE &&
+            ss->snd_una == ss->snd_nxt &&
+            received == TEST_FILE_SIZE) {
+
+            printf("[B] full-duplex done, sending FIN...\n");
+            scp_close(1);
+
+            while (ss->state != SCP_CLOSED) {
+                scp_timer_process();
+                int rn2 = cal_udp_recv(&udp, rxbuf, sizeof(rxbuf), &src);
+                if (rn2 > 0) scp_input(ss, rxbuf, rn2);
+                usleep(1000);
+            }
+            printf("[B] CLOSED.\n");
+            break;
+        }
+
+        usleep(1000);
+    }
+
+out:
+    close(fd_send);
+    close(fd_recv);
     return 0;
 }
