@@ -194,7 +194,7 @@ int main(void)
 #include "scp.h"
 
 #define SEND_BUF 2048
-#define TEST_FILE_SIZE (10 *1024 * 1024)   
+#define TEST_FILE_SIZE (10 * 1024 * 1024)   
 
 struct scp_udp_user {
     cal_udp_ctx_t *udp;

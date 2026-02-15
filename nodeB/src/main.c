@@ -201,7 +201,7 @@ printf("[C] MQ_B_TO_C = '%s'\n", MQ_B_TO_C);
 #include "scp.h"
 
 #define RECV_BUF 2048
-#define TEST_FILE_SIZE (10*1024 * 1024)
+#define TEST_FILE_SIZE (10 * 1024 * 1024)
 
 struct scp_udp_user {
     cal_udp_ctx_t *udp;
