@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include "link_list.h"
 
-
+#define RETRANS_COUNT_MAX 7
 #define MIN_SEG 32
 #define SCP_RTO_MIN 50
 #define SCP_RECV_LIMIT 0xFFFF
@@ -77,6 +77,7 @@ struct scp_stream {
 
     uint32_t snd_una;
     uint32_t snd_nxt;
+    uint32_t snd_sent;
     uint32_t snd_wnd;
 
     uint32_t rcv_nxt;
@@ -111,6 +112,10 @@ struct scp_stream {
     uint8_t retry;    // handshake/fin retry count
     uint32_t hs_timer;   // handshake timer
     uint32_t fin_timer;  // fin timer
+
+    uint32_t cwnd; 
+    uint32_t ssthresh;
+    uint8_t dup_acks;
 };
 
 /*

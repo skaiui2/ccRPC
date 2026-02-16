@@ -142,18 +142,19 @@ struct scp_stream *scp_stream_alloc(struct scp_transport_class *st_class, int sr
             .rcv_wnd  = RECV_WIN_INIT,
             .snd_wnd  = SEND_WIN_INIT,
             .persist_backoff = SCP_RTO_MIN,
+            .st_class = st_class,
+            .state = SCP_CLOSED,
+            .iss = 0,
             .zero_wnd = 0,
             .rcv_nxt = 0,
             .snd_nxt = 0,
+            .snd_sent = 0,
             .snd_una = 0,
+            .cwnd = MTU, 
+            .ssthresh = 0xFFFF,
+            .dup_acks = 0,
     };
     memset(ss->timer, 0, sizeof(ss->timer));
-
-    ss->st_class = st_class;
-    ss->state = SCP_CLOSED;
-    ss->iss = 0;
-    ss->snd_nxt = 0;
-    ss->snd_una = 0;
 
     list_node_init(&ss->node);
     list_node_init(&ss->snd_q);
@@ -217,17 +218,9 @@ static inline void scp_update_rcv_wnd(struct scp_stream *s)
 
     if (old != 0 && s->rcv_wnd == 0) {
         struct list_node *p;
-        /*
-        printf("### RCV_WND->0: rcv_nxt=%u, sb_cc=%u, hiwat=%u, rcv_buf_q:\n",
-               s->rcv_nxt, s->sb_cc, s->sb_hiwat);
-        */
         for (p = s->rcv_buf_q.next; p != &s->rcv_buf_q; p = p->next) {
             struct scp_buf *b = container_of(p, struct scp_buf, node);
             uint32_t plen = b->len - sizeof(struct scp_hdr);
-            /*
-            printf("    [buf] seq=%u len=%u end=%u\n",
-                   b->seq, plen, b->seq + plen);
-            */
         }
     }
 }
@@ -271,12 +264,8 @@ static void scp_retransmit(struct scp_stream *ss)
 {
     struct list_node *n;
 
-    /* Karn：重传时不再做 RTT 采样 */
     ss->rtt_ts = 0;
-/*
-    printf("### RETRANS_START: snd_una=%u snd_nxt=%u\n",
-           ss->snd_una, ss->snd_nxt);
-*/
+
     for (n = ss->snd_q.next; n != &ss->snd_q; n = n->next) {
         struct scp_buf *sb = container_of(n, struct scp_buf, node);
 
@@ -288,31 +277,18 @@ static void scp_retransmit(struct scp_stream *ss)
         uint32_t seg_start = sb->seq;
         uint32_t seg_end   = sb->seq + total_payload;
 
-        /* 已完全确认的段跳过 */
         if (SEQ_LEQ(seg_end, ss->snd_una)) {
-            /*
-            printf("### RETRANS_SKIP_FULLY_ACKED: seg=[%u,%u) snd_una=%u\n",
-                   seg_start, seg_end, ss->snd_una);
-            */
             continue;
         }
 
-        /* 部分确认：从 snd_una 之后开始重传 */
         if (SEQ_LT(seg_start, ss->snd_una)) {
             uint32_t trim = ss->snd_una - seg_start;
             if (trim >= total_payload) {
-                /*
-                printf("### RETRANS_SKIP_TRIM_FULL: seg=[%u,%u) snd_una=%u\n",
-                       seg_start, seg_end, ss->snd_una);
-                */
                 continue;
             }
             start_off = trim;
         }
-/*
-        printf("### RETRANS_SEG: orig=[%u,%u) retrans_from=%u\n",
-               seg_start, seg_end, sb->seq + start_off);
-*/
+
         while (start_off < total_payload) {
             uint32_t remain   = total_payload - start_off;
             uint32_t frag_len = min((uint32_t)(MTU - sizeof(struct scp_hdr)), remain);
@@ -320,15 +296,15 @@ static void scp_retransmit(struct scp_stream *ss)
             if (frag_len == 0)
                 break;
 
-            uint32_t frag_seq = sb->seq + start_off;
-            //printf("### RETRANS_FRAG: seq=%u len=%u\n", frag_seq, frag_len);
+                printf("[RTX] sb_seq=%u total=%u snd_una=%u start_off=%u frag_len=%u -> seq=%u\n",
+       sb->seq, total_payload, ss->snd_una, start_off, frag_len,
+       sb->seq + start_off);
 
             scp_output_data(ss, sb, start_off, frag_len);
             start_off += frag_len;
         }
     }
 
-    //printf("### RETRANS_END\n");
 }
 
 static void scp_output_connect(struct scp_stream *ss)
@@ -429,10 +405,24 @@ void scp_timer_process()
         if (ss->timer[TIMER_RETRANS] > 0) {
             ss->timer[TIMER_RETRANS]--;
             if (ss->timer[TIMER_RETRANS] == 0) {
+                uint32_t flight = ss->snd_sent - ss->snd_una;
+
+                uint32_t mss = MTU - sizeof(struct scp_hdr);
+                if (mss == 0) mss = 1;
+
+                uint32_t half = flight / 2;
+                uint32_t min_thresh = 2 * mss;
+                ss->ssthresh = (half > min_thresh) ? half : min_thresh;
+
+                ss->cwnd = mss;
+                ss->dup_acks = 0;
+
                 scp_retransmit(ss);
                 ss->timeout_count++;
 
-                if (ss->timeout_count > 6) {
+                printf("[TIMER] fd=%d state=%d timeout_count=%u una=%u nxt=%u sent=%u\n", ss->src_fd, ss->state, ss->timeout_count, ss->snd_una, ss->snd_nxt, ss->snd_sent);
+
+                if (ss->timeout_count > RETRANS_COUNT_MAX) {
                     ss->state = SCP_CLOSED;
                     scp_stream_free(ss);
                     cur = next;
@@ -457,23 +447,22 @@ void scp_timer_process()
             }
         }
 
-        if (ss->hs_timer > 0) { 
-            ss->hs_timer--; 
-            if (ss->hs_timer == 0) { 
-                scp_handle_handshake_timeout(ss); 
-            } 
-        } 
-        
+        if (ss->hs_timer > 0) {
+            ss->hs_timer--;
+            if (ss->hs_timer == 0) {
+                scp_handle_handshake_timeout(ss);
+            }
+        }
+
         if (ss->fin_timer > 0) {
-            ss->fin_timer--; 
-            if (ss->fin_timer == 0) { 
-                scp_handle_fin_timeout(ss); 
-            } 
+            ss->fin_timer--;
+            if (ss->fin_timer == 0) {
+                scp_handle_fin_timeout(ss);
+            }
         }
 
         cur = next;
     }
-
 }
 
 static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
@@ -490,7 +479,8 @@ static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
     sb->seq = seq;
     uint32_t end = seq + payload_len;
 
-    /* 0. 清理 rcv_buf_q 中所有已经完全落在 rcv_nxt 之前的段 */
+    printf("[DATA] state=%d seq=%u end=%u rcv_nxt=%u sb_cc=%u rcv_wnd=%u\n", s->state, seq, end, s->rcv_nxt, s->sb_cc, s->rcv_wnd);
+
     {
         struct list_node *p = s->rcv_buf_q.next;
         while (p != &s->rcv_buf_q) {
@@ -509,13 +499,12 @@ static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
         }
     }
 
-    /* 1. 完全在 rcv_nxt 之前的老数据，直接丢弃 */
     if (SEQ_LEQ(end, s->rcv_nxt)) {
+        scp_output(s, SCP_FLAG_ACK);
         scp_buf_free(sb);
         return;
     }
 
-    /* 2. 与 rcv_nxt 有重叠：裁掉前面已经收到的部分 */
     if (SEQ_LT(seq, s->rcv_nxt)) {
         uint32_t trim = s->rcv_nxt - seq;
         seq         += trim;
@@ -533,17 +522,12 @@ static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
         end = seq + payload_len;
     }
 
-    /* 这里保证：seq >= rcv_nxt 且 payload_len > 0 */
-
-    /* 3. 刚好是下一个期望字节：直接按序交付 */
     if (SEQ_EQ(seq, s->rcv_nxt)) {
-        /* 3.1 交付当前段 */
         s->rcv_nxt += payload_len;
         queue_enqueue(&s->rcv_data_q, &sb->node);
         s->sb_cc += payload_len;
         scp_update_rcv_wnd(s);
 
-        /* 3.2 再从 rcv_buf_q 里拼接连续段 */
         while (!list_empty(&s->rcv_buf_q)) {
             struct scp_buf *b = container_of(s->rcv_buf_q.next,
                                              struct scp_buf, node);
@@ -556,7 +540,6 @@ static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
             list_remove(&b->node);
             queue_enqueue(&s->rcv_data_q, &b->node);
             s->rcv_nxt += b_plen;
-            /* sb_cc 在插入 rcv_buf_q 时已经加过，这里只是队列迁移，不再重复加 */
             scp_update_rcv_wnd(s);
         }
 
@@ -564,34 +547,26 @@ static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
         return;
     }
 
-    /* 4. seq > rcv_nxt：乱序数据，插入 rcv_buf_q，保证不重叠 */
-
     struct list_node *pos;
     struct scp_buf *b;
 
-    /* 找到第一个 b->seq > seq 的位置，按 seq 升序插入 */
     for (pos = s->rcv_buf_q.next; pos != &s->rcv_buf_q; pos = pos->next) {
         b = container_of(pos, struct scp_buf, node);
         if (SEQ_GT(b->seq, seq))
             break;
     }
 
-    /* 4.1 左侧重叠：看前一个节点 prev 是否覆盖了新段的头部 */
     if (pos->prev != &s->rcv_buf_q) {
         struct scp_buf *prev = container_of(pos->prev, struct scp_buf, node);
         uint32_t p_seq = prev->seq;
         uint32_t p_end = p_seq + (prev->len - sizeof(struct scp_hdr));
 
         if (SEQ_GT(p_end, seq)) {
-            /* prev_end > seq，说明新段头部与 prev 重叠 */
-
             if (SEQ_GEQ(p_end, end)) {
-                /* prev 完全覆盖 [seq, end)，新段是纯重复，丢弃 */
                 scp_buf_free(sb);
                 return;
             }
 
-            /* 裁掉新段头部与 prev 重叠的部分 */
             uint32_t trim = p_end - seq;
             seq         += trim;
             payload_len -= trim;
@@ -609,18 +584,14 @@ static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
         }
     }
 
-    /* 4.2 右侧重叠：看插入位置 pos 本身是否与新段尾部重叠 */
     if (pos != &s->rcv_buf_q) {
         b = container_of(pos, struct scp_buf, node);
         uint32_t b_seq = b->seq;
         uint32_t b_end = b_seq + (b->len - sizeof(struct scp_hdr));
 
         if (SEQ_GT(b_seq, seq) && SEQ_GT(end, b_seq)) {
-            /* 新段尾部与右邻居 b 重叠，只裁剪新段尾部 */
-
             uint32_t new_len = b_seq - seq;
             if (new_len == 0) {
-                /* 新段完全落在 b 里面，纯重复，丢弃 */
                 scp_buf_free(sb);
                 return;
             }
@@ -632,13 +603,11 @@ static void scp_process_data(struct scp_stream *s, struct scp_buf *sb)
         }
     }
 
-    /* 4.3 经过裁剪后，如果 payload_len 变成 0，就没必要插入了 */
     if (payload_len == 0) {
         scp_buf_free(sb);
         return;
     }
 
-    /* 4.4 插入到 rcv_buf_q 中（此时保证不与左右邻居重叠） */
     list_add_prev(pos, &sb->node);
     s->sb_cc += payload_len;
     scp_update_rcv_wnd(s);
@@ -658,8 +627,10 @@ void scp_snd_buf_free(struct scp_stream *ss, uint32_t ack)
         uint32_t end_seq     = sb->seq + payload_len;
 
         if (SEQ_LEQ(end_seq, ack)) {
-            //printf("### SND_FREE: seq=%u end=%u ack=%u\n", sb->seq, end_seq, ack);
             list_remove(cur);
+            printf("[SND_FREE] sb_seq=%u end=%u ack=%u\n",
+       sb->seq, sb->seq + (sb->len - sizeof(struct scp_hdr)), ack);
+
             scp_buf_free(sb);
             cur = next;
             continue;
@@ -669,113 +640,96 @@ void scp_snd_buf_free(struct scp_stream *ss, uint32_t ack)
     }
 }
 
-/*
- * snd_una <= ack <= snd_nxt
- */
 static void scp_process_ack(struct scp_stream *ss, uint32_t ack, uint32_t wnd, uint32_t timestamp)
 {
-    /* 1. 基本合法性检查 */
     if (SEQ_LT(ack, ss->snd_una) || SEQ_GT(ack, ss->snd_nxt)) {
-        /*
-        printf("### ACK_DROP: ack=%u snd_una=%u snd_nxt=%u\n",
-               ack, ss->snd_una, ss->snd_nxt);
-        */
         return;
     }
 
     uint32_t old_una = ss->snd_una;
 
-    /* 2. RTT 采样（Karn） */
     if (ss->rtt_ts != 0 && SEQ_GEQ(ack, ss->rtt_seq)) {
         uint32_t sample = scp_clock - ss->rtt_ts;
         if (sample == 0) sample = 1;
         scp_update_rtt(ss, sample);
         ss->rtt_ts = 0;
-        /*
-        printf("### RTT_SAMPLE: sample=%u rto=%u srtt=%u rttvar=%u\n",
-               sample, ss->rto, ss->srtt, ss->rttvar);
-        */
     }
 
-    /* 3. 更新 snd_una / 对端窗口 */
     ss->snd_una = ack;
     ss->snd_wnd = wnd;
 
-    /* 4. 释放已确认的发送缓冲 */
     scp_snd_buf_free(ss, ack);
 
-    /* 5. 有新数据被确认：正常前进路径 */
     if (SEQ_GT(ss->snd_una, old_una)) {
-        /*
-        printf("### ACK_ADV: old_una=%u new_una=%u snd_nxt=%u wnd=%u\n",
-               old_una, ss->snd_una, ss->snd_nxt, ss->snd_wnd);
-        */
+        uint8_t was_fr = (ss->dup_acks >= 3);
+
         ss->timeout_count = 0;
+        ss->dup_acks = 0;
+
+        if (was_fr) {
+            ss->cwnd = ss->ssthresh;
+        } else {
+            uint32_t acked = ss->snd_una - old_una;
+            uint32_t mss = MTU - sizeof(struct scp_hdr);
+            if (mss == 0) mss = 1;
+
+            if (ss->cwnd < ss->ssthresh) {
+                ss->cwnd += acked;
+            } else {
+                uint32_t base = ss->cwnd ? ss->cwnd : 1;
+                uint32_t inc = (mss * mss) / base;
+                if (inc == 0) inc = 1;
+                ss->cwnd += inc;
+            }
+        }
 
         if (ss->snd_una == ss->snd_nxt) {
-            /* 所有已发送数据都确认了，没有飞行数据 */
             ss->timer[TIMER_RETRANS] = 0;
-            /*
-            printf("### ACK_ALL_CONFIRMED: snd_una=%u snd_nxt=%u\n",
-                   ss->snd_una, ss->snd_nxt);
-            */
         } else {
-            /* 仍有未确认数据，保持/重启 RTO 计时 */
             ss->timer[TIMER_RETRANS] = ss->rto;
-            /*
-            printf("### ACK_PARTIAL: snd_una=%u snd_nxt=%u rto=%u\n",
-                   ss->snd_una, ss->snd_nxt, ss->rto);
-            */
         }
     } else {
-        /*
-         * 6. 这里是“重复 ACK”路径：ack == old_una
-         */
+        if (SEQ_LT(ss->snd_una, ss->snd_nxt)) {
+            ss->dup_acks++;
 
-        /*
-        printf("### ACK_DUP: ack=%u snd_una=%u snd_nxt=%u wnd=%u timer_retrans=%u\n",
-               ack, ss->snd_una, ss->snd_nxt, ss->snd_wnd, ss->timer[TIMER_RETRANS]);
-        */
-        if (SEQ_LT(ss->snd_una, ss->snd_nxt) &&
-            ss->timer[TIMER_RETRANS] == 0) {
-/*
-            printf("### FAST_RETX_TRIGGER: snd_una=%u snd_nxt=%u\n",
-                   ss->snd_una, ss->snd_nxt);
-*/
-            /* 直接重传所有未确认数据 */
-            scp_retransmit(ss);
+            if (ss->dup_acks == 3) {
+                uint32_t flight = ss->snd_sent - ss->snd_una;
+                uint32_t mss = MTU - sizeof(struct scp_hdr);
+                if (mss == 0) mss = 1;
 
-            /* 重传后启动 RTO 计时 */
-            ss->timeout_count = 1;
-            ss->timer[TIMER_RETRANS] = ss->rto;
+                uint32_t half = flight / 2;
+                uint32_t min_thresh = 2 * mss;
+                ss->ssthresh = (half > min_thresh) ? half : min_thresh;
+
+                ss->cwnd = ss->ssthresh + 3 * mss;
+
+                scp_retransmit(ss);
+
+                ss->timeout_count = 1;
+                ss->timer[TIMER_RETRANS] = ss->rto;
+            } else if (ss->dup_acks > 3) {
+                uint32_t mss = MTU - sizeof(struct scp_hdr);
+                if (mss == 0) mss = 1;
+                ss->cwnd += mss;
+            }
         }
     }
 
-    /* 7. 零窗口处理：只影响“新数据发送”和 PERSIST，不影响重传 */
     if (wnd == 0) {
-        //printf("### ACK_ZERO_WND: snd_una=%u snd_nxt=%u wnd=%u zero_wnd=%d\n",
-               //ss->snd_una, ss->snd_nxt, wnd, ss->zero_wnd);
-
         if (!ss->zero_wnd) {
             ss->zero_wnd = 1;
             ss->persist_backoff = 5;
             ss->timer[TIMER_PERSIST] = ss->persist_backoff;
-            //printf("### PERSIST_START: backoff=%u\n", ss->persist_backoff);
         }
     } else {
-        /* 窗口重新打开 */
         int was_zero = ss->zero_wnd;
         ss->zero_wnd = 0;
         ss->persist_backoff = 5;
         ss->timer[TIMER_PERSIST] = 0;
-/*
-        printf("### WND_OPEN: wnd=%u was_zero=%d snd_una=%u snd_nxt=%u\n",
-               wnd, was_zero, ss->snd_una, ss->snd_nxt);
-*/
-        if (ss->snd_una != ss->snd_nxt && ss->timer[TIMER_RETRANS] == 0) {
+
+        if (was_zero && ss->snd_una != ss->snd_nxt && ss->timer[TIMER_RETRANS] == 0) {
             ss->timer[TIMER_RETRANS] = ss->rto;
             ss->timeout_count = 0;
-            //printf("### RETRANS_TIMER_START_ON_WND_OPEN: rto=%u\n", ss->rto);
         }
     }
 }
@@ -817,7 +771,9 @@ void scp_output_data(struct scp_stream *ss, struct scp_buf *sb,
         if (!pkt)
             return;
     }
-    uint32_t seq = sb->seq + offset;       
+
+    uint32_t seq = sb->seq + offset;   
+    uint32_t end_seq = seq + frag_len;
 
     struct scp_hdr hdr;
     uint8_t *payload_base = sb->data + sizeof(struct scp_hdr);
@@ -841,6 +797,10 @@ void scp_output_data(struct scp_stream *ss, struct scp_buf *sb,
     scp_dump_hdr(ss, "DATA", &hdr);
     ss->st_class->send(ss->st_class->user, pkt, pkt_len);
 
+    if (SEQ_GT(end_seq, ss->snd_sent)) {
+        ss->snd_sent = end_seq;
+    }
+
     if (pkt != small_buf)
         free(pkt);
 }
@@ -859,6 +819,8 @@ static int scp_output(struct scp_stream *ss, int flags)
 
     int sent_any = 0;
 
+    uint32_t flight = ss->snd_sent - ss->snd_una;
+
     struct list_node *n;
     for (n = ss->snd_q.next; n != &ss->snd_q; n = n->next) {
 
@@ -874,36 +836,23 @@ static int scp_output(struct scp_stream *ss, int flags)
         while (sent < total) {
             uint32_t remain = total - sent;
 
-            int64_t flight = 0;
-            struct list_node *fn;
-            for (fn = ss->snd_q.next; fn != &ss->snd_q; fn = fn->next) {
-                struct scp_buf *fb = container_of(fn, struct scp_buf, node);
-
-                uint32_t plen  = fb->len - sizeof(struct scp_hdr);
-                uint32_t start = fb->seq;
-                uint32_t end   = fb->seq + plen;
-
-                if (SEQ_LEQ(end, ss->snd_una))
-                    continue;
-
-                if (SEQ_LT(start, ss->snd_una)) {
-                    flight += end - ss->snd_una;
-                } else {
-                    flight += plen;
-                }
-            }
-
             if (ss->zero_wnd || ss->snd_wnd == 0) {
                 goto out;
             }
 
-            int32_t swnd = (int32_t)ss->snd_wnd - (int32_t)flight;
+            uint32_t win = ss->snd_wnd;
+            if (ss->cwnd < win)
+                win = ss->cwnd;
+
+            int32_t swnd = (int32_t)win - (int32_t)flight;
             if (swnd <= 0) {
                 goto out;
             }
 
             uint32_t frag_len = min((uint32_t)(MTU - sizeof(struct scp_hdr)), remain);
-            frag_len = min(frag_len, (uint32_t)swnd);
+            if (frag_len > (uint32_t)swnd)
+                frag_len = (uint32_t)swnd;
+
             if (frag_len == 0) {
                 goto out;
             }
@@ -912,6 +861,7 @@ static int scp_output(struct scp_stream *ss, int flags)
 
             sb->sent_off += frag_len;
             sent         += frag_len;
+            flight       += frag_len;  
             sent_any      = 1;
         }
     }
@@ -934,6 +884,7 @@ int scp_connect(int fd)
     ss->iss     = random32();
     ss->snd_nxt = ss->iss;
     ss->snd_una = ss->iss;
+    ss->snd_sent = ss->iss;
 
     ss->state   = SCP_SYN_SENT;
     ss->retry   = 0;
@@ -944,35 +895,33 @@ int scp_connect(int fd)
     return 0;
 }
 
-
 int scp_send(int fd, void *buf, size_t len)
 {
-    struct scp_stream *ss;
-
-    ss = hashmap_get(&scp_stream_map, (void *)(uintptr_t)fd);
+    struct scp_stream *ss = hashmap_get(&scp_stream_map, (void *)(uintptr_t)fd);
     if (!ss) return -1;
-
     if (ss->state != SCP_ESTABLISHED) return -1;
 
-    uint32_t seq_base = ss->snd_nxt; 
-    uint32_t flight = ss->snd_nxt - ss->snd_una;  
-    if (flight >= ss->snd_wnd) {
-        return -2; // EWOULDBLOCK
-    }
+    uint32_t flight = ss->snd_sent - ss->snd_una;
 
+    uint32_t win = ss->snd_wnd;
+    if (ss->cwnd < win) win = ss->cwnd;
+
+    if (flight >= win) return -2;
+
+    uint32_t seq_base = ss->snd_nxt;
     ss->snd_nxt += len;
 
     struct scp_buf *sb = scp_buf_alloc(sizeof(struct scp_buf) + sizeof(struct scp_hdr) + len);
+    if (!sb) return -1;
+
     sb->data = (uint8_t *)sb + sizeof(struct scp_buf);
-    sb->len = sizeof(struct scp_hdr) + len;
+    sb->len  = sizeof(struct scp_hdr) + len;
+    sb->seq  = seq_base;
 
-    sb->seq = seq_base;
-
-    //copy or not copy, this is a question.
     uint8_t *pure_data = (uint8_t *)sb->data + sizeof(struct scp_hdr);
     memcpy(pure_data, buf, len);
     queue_enqueue(&ss->snd_q, &sb->node);
-    
+
     scp_output(ss, SCP_FLAG_DATA);
 
     return 0;
@@ -993,6 +942,7 @@ static void scp_close_process(struct scp_stream *ss,
         ss->iss     = random32();
         ss->snd_nxt = ss->iss;
         ss->snd_una = ss->iss;
+        ss->snd_sent = ss->iss;
 
         scp_output_connect_ack(ss);
         ss->hs_timer = ss->rto;
@@ -1050,10 +1000,16 @@ static void scp_syn_recv_process(struct scp_stream *ss,
     scp_buf_free(sb);
 }
 
-static void scp_est_process(struct scp_stream *ss, struct scp_hdr *sh, struct scp_buf *sb,
+static void scp_est_process(struct scp_stream *ss,
+                            struct scp_hdr *sh,
+                            struct scp_buf *sb,
                             uint32_t ack,
                             uint32_t wnd)
 {
+    if (sh->flags & (SCP_FLAG_ACK | SCP_FLAG_PING)) {
+        scp_process_ack(ss, ack, wnd, scp_clock);
+    }
+
     if (sh->flags & SCP_FLAG_FIN) {
         uint32_t seq = ntohl(sh->seq);
 
@@ -1063,7 +1019,7 @@ static void scp_est_process(struct scp_stream *ss, struct scp_hdr *sh, struct sc
             return;
         }
 
-        ss->rcv_nxt = seq;   
+        ss->rcv_nxt = seq;
         scp_output_ack(ss);
 
         ss->state     = SCP_LAST_ACK;
@@ -1078,11 +1034,8 @@ static void scp_est_process(struct scp_stream *ss, struct scp_hdr *sh, struct sc
     if (sh->flags & SCP_FLAG_DATA) {
         scp_process_data(ss, sb);
         return;
-    } else if (sh->flags & SCP_FLAG_ACK) {
-        scp_process_ack(ss, ack, wnd, scp_clock);
-    } else if (sh->flags & SCP_FLAG_PING) {
-        scp_process_ack(ss, ack, wnd, scp_clock);
     }
+
     scp_buf_free(sb);
 }
 
@@ -1278,24 +1231,6 @@ int scp_recv(int fd, void *buf, size_t len)
             sb->payload_off += take;
         }
     }
-
-    /* 
-    if (copied > 0) {
-        int rcv_buf_q_len = 0;
-        struct list_node *p;
-        for (p = s->rcv_buf_q.next; p != &s->rcv_buf_q; p = p->next)
-            rcv_buf_q_len++;
-
-        int rcv_data_q_len = 0;
-        for (p = s->rcv_data_q.next; p != &s->rcv_data_q; p = p->next)
-            rcv_data_q_len++;
-
-        printf("### RECV_APP: fd=%d copied=%zu sb_cc=%u rcv_wnd=%u "
-               "rcv_buf_q=%d rcv_data_q=%d rcv_nxt=%u\n",
-               fd, copied, s->sb_cc, s->rcv_wnd,
-               rcv_buf_q_len, rcv_data_q_len, s->rcv_nxt);
-    }
-   */
 
     if (copied > s->sb_cc) {
         s->sb_cc = 0;
