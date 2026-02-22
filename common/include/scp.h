@@ -4,15 +4,33 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "link_list.h"
+#include "rbtree.h"
 
-#define RETRANS_COUNT_MAX 7
+typedef void (*scp_timer_cb_t)(void *arg);
+typedef void *scp_timer_handle_t;
+
+struct scp_timer {
+    struct rb_node node;
+    uint32_t expire;   
+    uint32_t timeout;
+    scp_timer_cb_t cb; 
+    void *arg;
+    uint8_t active; //If node in tree, set it. 
+};
+
+//Set by yourself.
+#define RETRANS_COUNT_MAX 12
 #define MIN_SEG 32
-#define SCP_RTO_MIN 50
+#define SCP_RTO_MIN 100
+#define SCP_RTO_MAX 1000
 #define SCP_RECV_LIMIT 0xFFFF
 #define SEND_WIN_INIT 0xFFFF
 #define RECV_WIN_INIT     0xFFFF
+#define SSTHRESH_INIT 0xFFFF
 #define MTU 1460
-
+#define PERSIST_INTERVAL 200
+#define MAX_IDLE_FAIL  3
+#define IDLE_TIMEOUT 100000
 
 struct scp_transport_class {
     int (*send)(void *user, const void *buf, size_t len);
@@ -22,7 +40,10 @@ struct scp_transport_class {
 };
 
 struct scp_buf {
-    struct list_node node;
+    union { 
+        struct list_node list; 
+        struct rb_node rb; 
+    };
     size_t len;
     uint32_t seq; // save it from hdr.
     uint32_t sent_off;
@@ -33,11 +54,12 @@ struct scp_buf {
 struct scp_hdr {
     uint32_t seq;
     uint32_t ack;
+    uint32_t sack; //first hollow
+    uint32_t fd;
     uint16_t wnd;
     uint16_t len;
     uint16_t cksum;
-    uint8_t flags;
-    uint8_t fd;
+    uint16_t flags;
 } __attribute__((packed));
 
 #define SCP_FLAG_DATA  0x01
@@ -49,13 +71,6 @@ struct scp_hdr {
 #define SCP_FLAG_CONNECT_ACK 0x40
 #define SCP_FLAG_FIN         0x80 
 
-#define TIMER_RETRANS 0
-#define TIMER_KEEPALIVE 1
-#define TIMER_PERSIST 2
-#define TIMER_HS      3
-#define TIMER_FIN     4
-#define TIMER_COUNT   5
-
 enum {
     SCP_CLOSED,
     SCP_SYN_SENT,
@@ -66,56 +81,66 @@ enum {
     SCP_LAST_ACK,
 };
 
-
 struct scp_stream {
-    struct list_node node;
-    struct scp_transport_class *st_class;
-    uint32_t timer[TIMER_COUNT];
+    struct list_node node;              // linked into global stream list
+    struct scp_transport_class *st_class; // transport callbacks (send/recv)
 
-    uint8_t dst_fd;
-    uint8_t src_fd;
+    struct scp_timer t_retrans;         // retransmission timer
+    struct scp_timer t_persist;         // persist / keepalive timer
+    struct scp_timer t_hs;              // handshake retry timer
+    struct scp_timer t_fin;             // FIN retry timer
 
-    uint32_t snd_una;
-    uint32_t snd_nxt;
-    uint32_t snd_sent;
-    uint32_t snd_wnd;
+    uint32_t dst_fd;                    // remote endpoint id
+    uint32_t src_fd;                    // local endpoint id
 
-    uint32_t rcv_nxt;
-    uint32_t rcv_wnd;
+    uint32_t snd_una;                   // first unacknowledged seq
+    uint32_t snd_nxt;                   // next seq to enqueue
+    uint32_t snd_sent;                  // highest seq ever sent
+    uint32_t snd_wnd;                   // peer's advertised window
 
-    uint32_t snd_wmem;
-    uint32_t rcv_wmem;
+    uint32_t rcv_nxt;                   // next seq we expect
+    uint32_t rcv_wnd;                   // our advertised window
 
-    uint32_t srtt;
-    uint32_t rttvar;
-    uint32_t rto;
+    uint32_t snd_wmem;                  // send buffer watermark
+    uint32_t rcv_wmem;                  // recv buffer watermark
 
-    uint32_t rtt_ts;
-    uint32_t rtt_seq; //sequence number being timed
+    uint32_t packet_bytes;              //output bytes
+    uint32_t packet_count; 
 
-    uint8_t  timeout_count;
+    uint32_t srtt;                      // smoothed RTT
+    uint32_t rttvar;                    // RTT variation
+    uint32_t rto;                       // retransmission timeout
 
-    struct list_node snd_q;
+    uint32_t rtt_ts;                    // timestamp of RTT measurement
+    uint32_t rtt_seq;                   // seq being timed
 
-    struct list_node rcv_buf_q; //none orider
-    struct list_node rcv_data_q; // orider
-    uint32_t sb_hiwat;
-    uint32_t sb_cc;
+    uint8_t  timeout_count;             // consecutive timeout counter
 
-    uint32_t persist_backoff;  
-    uint8_t  zero_wnd;        
+    struct list_node snd_q;             // send queue (in-order)
 
-    uint32_t timestamp;
-    int state;
-    uint32_t iss;     // initial send seq
-    uint32_t irs;     // initial recv seq
-    uint8_t retry;    // handshake/fin retry count
-    uint32_t hs_timer;   // handshake timer
-    uint32_t fin_timer;  // fin timer
+    struct rb_root rcv_buf_q;           // out-of-order receive tree
+    struct list_node rcv_data_q;        // in-order delivered data
+    uint32_t sb_hiwat;                  // receive buffer limit
+    uint32_t sb_cc;                     // current receive buffer usage
 
-    uint32_t cwnd; 
-    uint32_t ssthresh;
-    uint8_t dup_acks;
+    uint32_t idle_failures;             // idle timeout counter
+    uint32_t last_active;               // last activity timestamp
+
+    uint32_t timestamp;                 // local timestamp
+    int state;                          // connection state
+    uint32_t iss;                       // initial send seq
+    uint32_t irs;                       // initial recv seq
+    uint8_t retry;                      // handshake/FIN retry count
+
+    uint32_t cwnd;                      // congestion window
+    uint32_t ssthresh;                  // slow start threshold
+    uint8_t dup_acks;                   // duplicate ACK counter
+
+    uint8_t fr_active; 
+
+    uint32_t pacing_rate;               // bytes per ms, estimated from acked/srtt
+    uint32_t pacing_credit;             // token bucket credit for pacing
+    uint32_t pacing_last_ts;            // last time we updated pacing_credit
 };
 
 /*
@@ -146,6 +171,6 @@ int scp_send(int fd, void *buf, size_t len);
 int scp_recv(int fd, void *buf, size_t len);
 void scp_close(int fd);
 
-void scp_timer_process();
+void scp_timer_process(void);
 
 #endif

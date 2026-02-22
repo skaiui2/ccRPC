@@ -5,5 +5,6 @@
 typedef void (*scp_timer_task)(void);
 int scp_time_init(void); 
 
+uint32_t scp_now_time(void);
 
 #endif
