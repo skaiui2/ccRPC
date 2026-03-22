@@ -1,6 +1,6 @@
 # ccRPC
 
-[中文介绍](./docs/中文/README中文)
+[中文介绍](./docs/中文/README中文.md)
 
 A Remote Procedure Call Protocol.
 
