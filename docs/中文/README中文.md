@@ -1,21 +1,28 @@
 # ccRPC
 
-[中文介绍](./docs/中文/README中文)
+ccRPC是一个远程调用方法。
 
-A Remote Procedure Call Protocol.
+我写它的目的是因为我需要在嵌入式环境中远程调用方法，但是没什么纯c的好用的rpc协议。
 
-I built it because I needed a reliable way to invoke remote functions in embedded environments, and there simply wasn’t a pure‑C RPC protocol that was small, portable, and practical enough.
+他可以让本地调用远程函数非常自然，有以下特征：
 
-ccRPC makes calling a remote function feel just like calling a local one, and it provides the following features:
+1.纯c，使用c宏配置xdef实现自动代码生成
 
-1. **Pure C implementation**, using a C‑macro–based XDEF DSL for automatic code generation
-2. **TLV encoding**, compact and predictable for embedded systems
-3. **Synchronous call model**, simple and natural to use
-4. **Thread‑safe runtime**, suitable for both MCU and Linux environments
-5. **Zero dependencies** — fully self‑contained memory management and data structures, portable to any platform
-6. **Extremely small footprint**, only a few kilobytes of RAM required
+2.tlv编码
+
+3.同步调用
+
+4.多线程安全
+
+5.零依赖，可移植到任何平台，内存管理、数据结构全是自己实现的
+
+6.内存占用极小，几KB就行
+
+
 
 ## DESIGN
+
+ccRPC是从完整的三层协议CSC中单独拆分下来的，ccRPC是第三层：
 
 ```
            application
@@ -44,13 +51,9 @@ ccRPC makes calling a remote function feel just like calling a local one, and it
 
 ```
 
-
-
 ## run
 
-The nodeB call nodeA's functions:
-
-Run nodeA:
+运行A节点：
 
 ```
 cd nodeA
@@ -61,22 +64,23 @@ make
 ./nodeA
 ```
 
-Run nodeB:
+运行B节点：
 
 ```
 cd nodeB
 mkdir build
 cd build
+
 ```
 
-copy the big.bin，then
+记得复制粘贴在nodeA的build目录下的大文件，因为我们的测试是一方调用另一方读取文件随机内容，然后自己读取一遍，最后对双方内容进行校验，然后，另一方调用对方的shell命令，也进行校验：
 
 ```
 make
 ./nodeB
 ```
 
-like this:
+最后运行：
 
 ```
 skaiuijing@ubuntu:~/rpc/nodeA/build$ ./nodeA 

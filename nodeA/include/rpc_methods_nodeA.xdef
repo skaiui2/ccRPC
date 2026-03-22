@@ -1,3 +1,15 @@
+RPC_METHOD_REQUEST(
+    shell_exec,
+    "shell.exec",
+    PARAMS(
+        FIELD(string, cmd);
+    ),
+    RESULTS(
+        FIELD(string, output);
+        FIELD(u32, exitcode);
+    )
+)
+
 RPC_METHOD_PROVIDER(
     fs_read,
     "fs.read",
@@ -13,14 +25,4 @@ RPC_METHOD_PROVIDER(
     )
 )
 
-RPC_METHOD_REQUEST(
-    shell_exec,
-    "shell.exec",
-    PARAMS(
-        FIELD(string, cmd);
-    ),
-    RESULTS(
-        FIELD(string, output);
-        FIELD(u32, exitcode);
-    )
-)
+

@@ -1,5 +1,3 @@
-/* NodeB: 提供 shell_exec，请求 fs_read */
-
 RPC_METHOD_PROVIDER(
     shell_exec,
     "shell.exec",

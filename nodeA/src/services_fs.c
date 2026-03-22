@@ -4,26 +4,40 @@
 #include <stdlib.h>
 #include "rpc_tlv.h"
 #include "rpc_gen.h"
-
+#include "heap.h"
 #include "rpc_gen.h"
 #include <stdio.h>
 #include <string.h>
 
-// 由 rpc_gen.c 自动 forward declare
 int fs_read_handler(const struct rpc_param_fs_read *in,
                     struct rpc_result_fs_read *out)
 {
-    printf("NodeA: fs_read(path=%s, offset=%u, size=%u)\n",
-           in->path ? in->path : "(null)",
-           (unsigned)in->offset,
-           (unsigned)in->size);
+    FILE *fp = fopen(in->path, "rb");
+    if (!fp)
+        return -1;
 
-    //返回固定内容 
-    static uint8_t dummy[] = "hello-from-NodeA";
-    out->data.ptr = dummy;
-    out->data.len = sizeof(dummy) - 1;
-    out->len = out->data.len;
-    out->eof = 1;
+    if (fseek(fp, in->offset, SEEK_SET) != 0) {
+        fclose(fp);
+        return -1;
+    }
 
+    uint8_t *p = heap_malloc(in->size);
+    if (!p) {
+        fclose(fp);
+        return -1;
+    }
+
+    size_t n = fread(p, 1, in->size, fp);
+    fclose(fp);
+
+    if (n != in->size) {
+        heap_free(p);
+        return -1;
+    }
+
+    out->data.ptr = p;
+    out->data.len = n;
+    out->len      = n;
+    out->eof      = 0;
     return 0;
 }

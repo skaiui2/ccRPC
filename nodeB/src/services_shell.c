@@ -1,21 +1,30 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <stdlib.h>
-#include "rpc_tlv.h"
 #include "rpc_gen.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include "services_shell.h"
-
+#include "heap.h"
 
 int shell_exec_handler(const struct rpc_param_shell_exec *in,
                        struct rpc_result_shell_exec *out)
 {
-    printf("NodeB: shell_exec(cmd=%s)\n",
-           in->cmd ? in->cmd : "(null)");
+    FILE *fp = popen(in->cmd, "r");
+    if (!fp)
+        return -1;
 
-    out->output = "dummy-output-from-NodeB";
-    out->exitcode = 0;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf)-1, fp);
+    buf[n] = 0;
+
+    int exitcode = pclose(fp);
+
+    char *s = heap_malloc(n + 1);
+    if (!s)
+        return -1;
+
+    memcpy(s, buf, n + 1);
+
+    out->output   = s;
+    out->exitcode = (uint32_t)exitcode;
 
     return 0;
 }
